@@ -1,0 +1,58 @@
+# Python bytecode, caches and build artifacts
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Local virtual environments
+venv/
+.venv/
+env/
+ENV/
+venv_damaged_*/
+
+# Private datasets and user-provided media
+videos/
+data/
+datasets/
+
+# Generated machine-learning artifacts
+model/
+checkpoints/
+logs/
+tensorboard_logs/
+*.keras
+*.h5
+*.tflite
+*.onnx
+*.joblib
+*.pkl
+*.npy
+*.npz
+
+# Local configuration, databases and secrets
+.env
+.env.*
+!.env.example
+instance/
+*.db
+*.sqlite
+*.sqlite3
+
+# IDE and operating system files
+.vscode/
+.idea/
+*.code-workspace
+.DS_Store
+Thumbs.db
+desktop.ini
+
