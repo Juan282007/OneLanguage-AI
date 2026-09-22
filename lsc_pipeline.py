@@ -11,21 +11,71 @@ LANDMARKS_PER_HAND = 21
 COORDINATES_PER_LANDMARK = 3
 SEQUENCE_LENGTH = 32
 FEATURE_SIZE = MAX_HANDS * LANDMARKS_PER_HAND * COORDINATES_PER_LANDMARK
-PREPROCESSING_VERSION = 2
+MOTION_FEATURE_SIZE = FEATURE_SIZE
+MIN_VISIBLE_FRAMES = 10
+SMOOTHING_ALPHA = 0.65
+PREPROCESSING_VERSION = 4
+NO_SIGN_LABEL = "__idle__"
+NO_SIGN_ALIASES = frozenset(
+    {
+        NO_SIGN_LABEL,
+        "background",
+        "idle",
+        "neutral",
+        "ninguno",
+        "no_sign",
+        "reposo",
+        "sin_sena",
+        "sin_senas",
+    }
+)
+DEFAULT_CONFIDENCE_THRESHOLD = 0.70
+DEFAULT_MINIMUM_MARGIN = 0.12
+DEFAULT_STABLE_PREDICTIONS = 4
 MODEL_PATH = Path("model/lsc_sequence_model.keras")
 LABELS_PATH = Path("model/lsc_labels.json")
 CONFIG_PATH = Path("model/lsc_config.json")
 
 
-class LandmarkExtractor:
+def normalize_label_token(label):
+    return str(label).casefold().strip().replace("-", "_").replace(" ", "_")
+
+
+def is_no_sign_label(label):
+    return normalize_label_token(label) in NO_SIGN_ALIASES
+
+
+def canonicalize_label(label):
+    """Maps supported neutral aliases to one stable model label."""
+    return NO_SIGN_LABEL if is_no_sign_label(label) else str(label).strip()
+
+
+def open_video_capture(source):
+    """Opens a camera or video and honors phone rotation metadata when available."""
+    capture = cv2.VideoCapture(source)
+    if capture.isOpened() and hasattr(cv2, "CAP_PROP_ORIENTATION_AUTO"):
+        capture.set(cv2.CAP_PROP_ORIENTATION_AUTO, 1)
+    return capture
+
+
+class Preprocessor:
+    """Single preprocessing contract shared by training and live recognition.
+
+    Frames are represented as float32 hand landmarks with shape (126,). A model
+    sequence always has a fixed number of frames and can optionally append
+    per-landmark motion features, resulting in 252 features per frame.
+    """
+
     def __init__(
         self,
         max_num_hands=MAX_HANDS,
         min_detection_confidence=0.5,
         min_tracking_confidence=0.5,
         include_wrist_trajectory=True,
+        include_motion_features=False,
     ):
         self.include_wrist_trajectory = include_wrist_trajectory
+        self.include_motion_features = include_motion_features
         self.mp_hands = mp.solutions.hands
         self.hands = self.mp_hands.Hands(
             static_image_mode=False,
@@ -83,6 +133,13 @@ class LandmarkExtractor:
 
         return np.concatenate([left.flatten(), right.flatten()])
 
+    def prepare_sequence(self, sequence, target_length=SEQUENCE_LENGTH):
+        return prepare_model_sequence(
+            sequence,
+            target_length=target_length,
+            include_motion_features=self.include_motion_features,
+        )
+
     @staticmethod
     def _normalize_hand(points):
         wrist = points[0].copy()
@@ -96,6 +153,10 @@ class LandmarkExtractor:
     def _normalize_wrist(wrist):
         # Center x/y so horizontal mirroring only needs to invert x.
         return np.array([wrist[0] - 0.5, wrist[1] - 0.5, wrist[2]], dtype=np.float32)
+
+
+# Kept as an alias for scripts that still import the previous public name.
+LandmarkExtractor = Preprocessor
 
 
 def resample_sequence(sequence, target_length=SEQUENCE_LENGTH):
@@ -113,10 +174,73 @@ def resample_sequence(sequence, target_length=SEQUENCE_LENGTH):
     return resized
 
 
+def smooth_landmarks(sequence, alpha=SMOOTHING_ALPHA):
+    """Applies EMA smoothing independently to each visible hand.
+
+    Missing hands remain all zeros and reset their smoothing state, preventing
+    a previous hand position from leaking into frames where it is absent.
+    """
+    sequence = np.asarray(sequence, dtype=np.float32)
+    if sequence.ndim != 2 or sequence.shape[1] != FEATURE_SIZE:
+        raise ValueError(f"Expected landmark sequence with shape (frames, {FEATURE_SIZE}).")
+
+    hands = sequence.reshape(len(sequence), MAX_HANDS, LANDMARKS_PER_HAND, COORDINATES_PER_LANDMARK)
+    smoothed = np.zeros_like(hands)
+    previous = [None] * MAX_HANDS
+
+    for frame_index, frame_hands in enumerate(hands):
+        for hand_index, hand in enumerate(frame_hands):
+            if not np.any(np.abs(hand) > 1e-6):
+                previous[hand_index] = None
+                continue
+            if previous[hand_index] is None:
+                current = hand
+            else:
+                current = alpha * hand + (1.0 - alpha) * previous[hand_index]
+            smoothed[frame_index, hand_index] = current
+            previous[hand_index] = current
+
+    return smoothed.reshape(len(sequence), FEATURE_SIZE)
+
+
+def append_motion_features(sequence):
+    """Adds frame-to-frame velocity without creating motion for missing hands."""
+    sequence = np.asarray(sequence, dtype=np.float32)
+    if sequence.ndim != 2 or sequence.shape[1] != FEATURE_SIZE:
+        raise ValueError(f"Expected landmark sequence with shape (frames, {FEATURE_SIZE}).")
+
+    hands = sequence.reshape(len(sequence), MAX_HANDS, LANDMARKS_PER_HAND, COORDINATES_PER_LANDMARK)
+    motion = np.zeros_like(hands)
+    visible = np.any(np.abs(hands) > 1e-6, axis=(2, 3))
+
+    for frame_index in range(1, len(sequence)):
+        valid_hands = visible[frame_index] & visible[frame_index - 1]
+        motion[frame_index, valid_hands] = hands[frame_index, valid_hands] - hands[frame_index - 1, valid_hands]
+
+    return np.concatenate([sequence, motion.reshape(len(sequence), MOTION_FEATURE_SIZE)], axis=1)
+
+
+def prepare_model_sequence(sequence, target_length=SEQUENCE_LENGTH, include_motion_features=False):
+    """Returns the exact fixed-shape input consumed by the TensorFlow model."""
+    fixed_length = resample_sequence(sequence, target_length)
+    smoothed = smooth_landmarks(fixed_length)
+    if include_motion_features:
+        return append_motion_features(smoothed).astype(np.float32)
+    return smoothed.astype(np.float32)
+
+
+def prepare_model_sequences(sequences, target_length=SEQUENCE_LENGTH, include_motion_features=False):
+    """Vector-like convenience wrapper used by training and validation."""
+    return np.asarray(
+        [prepare_model_sequence(sequence, target_length, include_motion_features) for sequence in sequences],
+        dtype=np.float32,
+    )
+
+
 def read_video_features(video_path, extractor=None):
     owns_extractor = extractor is None
     extractor = extractor or LandmarkExtractor()
-    capture = cv2.VideoCapture(str(video_path))
+    capture = open_video_capture(str(video_path))
     frames = []
 
     try:
@@ -170,15 +294,49 @@ def _window_starts(sequence, target_length, windows_per_video):
 def select_action_windows(sequence, target_length=SEQUENCE_LENGTH, windows_per_video=3):
     """Creates fixed-size high-motion windows equivalent to the live camera buffer."""
     sequence = _trim_to_visible_hands(np.asarray(sequence, dtype=np.float32))
+    if len(sequence) < MIN_VISIBLE_FRAMES:
+        return []
     if len(sequence) <= target_length:
         return [resample_sequence(sequence, target_length)]
     return [sequence[start : start + target_length] for start in _window_starts(sequence, target_length, windows_per_video)]
 
 
-def extract_video_sequences(video_path, extractor=None, sequence_length=SEQUENCE_LENGTH, windows_per_video=3):
+def select_live_action_window(sequence, target_length=SEQUENCE_LENGTH):
+    """Selects the most active current window using the same rule as training."""
+    windows = select_action_windows(sequence, target_length=target_length, windows_per_video=1)
+    if windows:
+        return windows[0]
+    return resample_sequence(sequence, target_length)
+
+
+def select_dense_windows(sequence, target_length=SEQUENCE_LENGTH, stride=None):
+    """Covers a negative clip densely so camera-like intermediate windows are learned."""
+    sequence = _trim_to_visible_hands(np.asarray(sequence, dtype=np.float32))
+    if len(sequence) < MIN_VISIBLE_FRAMES:
+        return []
+    if len(sequence) <= target_length:
+        return [resample_sequence(sequence, target_length)]
+
+    stride = max(1, int(stride or target_length // 4))
+    maximum_start = len(sequence) - target_length
+    starts = list(range(0, maximum_start + 1, stride))
+    if starts[-1] != maximum_start:
+        starts.append(maximum_start)
+    return [sequence[start : start + target_length] for start in starts]
+
+
+def extract_video_sequences(
+    video_path,
+    extractor=None,
+    sequence_length=SEQUENCE_LENGTH,
+    windows_per_video=3,
+    dense_windows=False,
+):
     features = read_video_features(video_path, extractor)
     if len(features) == 0 or not np.any(np.abs(features) > 1e-6):
         return []
+    if dense_windows:
+        return select_dense_windows(features, sequence_length)
     return select_action_windows(features, sequence_length, windows_per_video)
 
 

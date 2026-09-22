@@ -6,19 +6,43 @@ import tensorflow as tf
 from sklearn.model_selection import train_test_split
 from sklearn.utils.class_weight import compute_class_weight
 
-from lsc_pipeline import MODEL_PATH, SEQUENCE_LENGTH, LandmarkExtractor, extract_video_sequences, save_metadata
+from lsc_pipeline import (
+    DEFAULT_CONFIDENCE_THRESHOLD,
+    DEFAULT_MINIMUM_MARGIN,
+    DEFAULT_STABLE_PREDICTIONS,
+    MODEL_PATH,
+    NO_SIGN_LABEL,
+    SEQUENCE_LENGTH,
+    LandmarkExtractor,
+    canonicalize_label,
+    extract_video_sequences,
+    is_no_sign_label,
+    prepare_model_sequences,
+    save_metadata,
+)
 
 
 VIDEO_EXTENSIONS = {".avi", ".mov", ".mp4", ".mkv", ".webm"}
+IGNORED_DATASET_DIRECTORIES = {"__MACOSX", "__pycache__"}
 
 
 def collect_videos(dataset_dir):
     dataset_dir = Path(dataset_dir)
+    if not dataset_dir.is_dir():
+        raise SystemExit(f"No existe la carpeta de datos: {dataset_dir}")
+
     samples = []
-    for label_dir in sorted(path for path in dataset_dir.iterdir() if path.is_dir()):
+    label_directories = sorted(
+        path
+        for path in dataset_dir.iterdir()
+        if path.is_dir() and path.name not in IGNORED_DATASET_DIRECTORIES and not path.name.startswith(".")
+    )
+    for label_dir in label_directories:
+        label = canonicalize_label(label_dir.name)
         for video_path in sorted(label_dir.rglob("*")):
-            if video_path.suffix.lower() in VIDEO_EXTENSIONS:
-                samples.append((video_path, label_dir.name))
+            has_ignored_parent = any(parent.name in IGNORED_DATASET_DIRECTORIES for parent in video_path.parents)
+            if not has_ignored_parent and video_path.suffix.lower() in VIDEO_EXTENSIONS:
+                samples.append((video_path, label))
     return samples
 
 
@@ -152,8 +176,35 @@ def main():
         action="store_true",
         help="No crea variantes reflejadas para la mano contraria.",
     )
+    parser.add_argument(
+        "--no-motion-features",
+        action="store_true",
+        help="No agrega velocidades entre frames. Solo usar para conservar el formato anterior de 126 features.",
+    )
+    parser.add_argument(
+        "--inference-threshold",
+        type=float,
+        default=DEFAULT_CONFIDENCE_THRESHOLD,
+        help="Confianza que usara la camara para aceptar una traduccion.",
+    )
+    parser.add_argument(
+        "--inference-margin",
+        type=float,
+        default=DEFAULT_MINIMUM_MARGIN,
+        help="Separacion minima que usara la camara entre las dos clases mas probables.",
+    )
+    parser.add_argument(
+        "--stable-predictions",
+        type=int,
+        default=DEFAULT_STABLE_PREDICTIONS,
+        help="Predicciones consecutivas necesarias para confirmar una traduccion.",
+    )
     args = parser.parse_args()
     args.windows_per_video = max(1, args.windows_per_video)
+    args.inference_threshold = float(np.clip(args.inference_threshold, 0.0, 1.0))
+    args.inference_margin = float(np.clip(args.inference_margin, 0.0, 1.0))
+    args.stable_predictions = max(1, args.stable_predictions)
+    include_motion_features = not args.no_motion_features
 
     samples = collect_videos(args.data)
     if not samples:
@@ -177,12 +228,13 @@ def main():
     windows_by_video, video_labels = [], []
     try:
         for index, (video_path, label) in enumerate(samples, start=1):
-            print(f"[{index}/{len(samples)}] Extrayendo: {video_path}")
+            print(f"[{index}/{len(samples)}] Extrayendo: {video_path}", flush=True)
             windows = extract_video_sequences(
                 video_path,
                 extractor,
                 args.sequence_length,
                 args.windows_per_video,
+                dense_windows=is_no_sign_label(label),
             )
             if not windows:
                 print(f"  Aviso: no detecte manos en {video_path}; se omite del entrenamiento.")
@@ -200,10 +252,17 @@ def main():
     if missing_labels:
         raise SystemExit("No detecte manos en ningun video de: " + ", ".join(missing_labels))
     print("Videos por sena: " + ", ".join(f"{label}={raw_counts[index]}" for index, label in enumerate(labels)))
+    window_counts = np.zeros(len(labels), dtype=np.int64)
+    for windows, label_index in zip(windows_by_video, video_labels):
+        window_counts[label_index] += len(windows)
+    print("Ventanas por sena: " + ", ".join(f"{label}={window_counts[index]}" for index, label in enumerate(labels)))
     if raw_counts.max() > raw_counts.min() * 1.5:
         print("Aviso: hay un desbalance entre senas. Graba mas videos de las clases con menos ejemplos.")
-    if not any(label.casefold().strip() in {"nada", "reposo", "sin_sena", "sin senas"} for label in labels):
-        print("Consejo: agrega una carpeta 'nada' o 'reposo' para que la camara no fuerce una traduccion cuando no hay sena.")
+    if not any(is_no_sign_label(label) for label in labels):
+        print(
+            f"Consejo: agrega una carpeta '{NO_SIGN_LABEL}' para que la camara no fuerce "
+            "una traduccion cuando no hay sena."
+        )
 
     # Split videos before creating windows or augmentations. This prevents windows from
     # the same recording leaking into validation.
@@ -221,7 +280,7 @@ def main():
             validation_indexes,
             windows_by_video,
             video_labels,
-            primary_only=True,
+            primary_only=False,
         )
         X_train, y_train = expand_with_augmentation(
             X_train_raw,
@@ -234,7 +293,8 @@ def main():
         monitor_mode = "min"
         print(
             f"Entrenamiento: {len(train_indexes)} videos, {len(X_train_raw)} ventanas activas, "
-            f"{len(X_train)} secuencias con aumentos. Validacion: {len(X_val)} videos sin aumentos."
+            f"{len(X_train)} secuencias con aumentos. Validacion: {len(X_val)} ventanas de "
+            f"{len(validation_indexes)} videos sin aumentos."
         )
     else:
         print("Aviso: hay pocos videos; entrenaré sin conjunto de validación.")
@@ -249,6 +309,21 @@ def main():
         monitor = "loss"
         monitor_mode = "min"
         print(f"Dataset final: {len(X_train)} secuencias ({args.augmentations} aumentos por video).")
+
+    # Apply the same fixed-length smoothing and optional motion features used by the live recognizer.
+    X_train = prepare_model_sequences(
+        X_train,
+        args.sequence_length,
+        include_motion_features=include_motion_features,
+    )
+    if validation_data:
+        X_val_landmarks = X_val
+        X_val = prepare_model_sequences(
+            X_val_landmarks,
+            args.sequence_length,
+            include_motion_features=include_motion_features,
+        )
+        validation_data = (X_val, y_val)
 
     class_weights = compute_class_weight(class_weight="balanced", classes=np.unique(y_train), y=y_train)
     class_weight = {int(label): float(weight) for label, weight in zip(np.unique(y_train), class_weights)}
@@ -277,9 +352,17 @@ def main():
     model.fit(**fit_kwargs)
 
     if validation_data:
-        print_validation_report(model, X_val, y_val, labels, "Validacion por sena:")
+        print_validation_report(model, X_val, y_val, labels, "Validacion por ventanas de cada sena:")
         if not args.no_mirror_augmentation:
-            X_val_mirrored = np.asarray([mirror_sequence(sample) for sample in X_val], dtype=np.float32)
+            X_val_mirrored_landmarks = np.asarray(
+                [mirror_sequence(sample) for sample in X_val_landmarks],
+                dtype=np.float32,
+            )
+            X_val_mirrored = prepare_model_sequences(
+                X_val_mirrored_landmarks,
+                args.sequence_length,
+                include_motion_features=include_motion_features,
+            )
             mirrored_metrics = model.evaluate(X_val_mirrored, y_val, verbose=0, return_dict=True)
             print(f"Validacion espejo: accuracy={mirrored_metrics['accuracy']:.1%}, loss={mirrored_metrics['loss']:.4f}")
 
@@ -287,7 +370,15 @@ def main():
     save_metadata(
         labels,
         args.sequence_length,
-        extra_metadata={"windows_per_video": args.windows_per_video},
+        extra_metadata={
+            "windows_per_video": args.windows_per_video,
+            "include_motion_features": include_motion_features,
+            "feature_size": int(X_train.shape[2]),
+            "no_sign_label": NO_SIGN_LABEL,
+            "confidence_threshold": args.inference_threshold,
+            "minimum_margin": args.inference_margin,
+            "stable_predictions": args.stable_predictions,
+        },
     )
     print(f"Modelo guardado en {MODEL_PATH}")
     print(f"Etiquetas guardadas: {', '.join(labels)}")

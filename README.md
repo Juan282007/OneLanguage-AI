@@ -46,20 +46,23 @@ videos/
     video1.mp4
   regular/
     video1.mp4
-  nada/
+  __idle__/
     video1.mp4
 ```
 
 ### Que guardar en cada carpeta
 
 - `hola/`, `bien/`, `mal/`, `regular/`: un video por archivo con una unica sena completa.
-- `nada/`: ejemplos de ausencia de sena. Incluye manos relajadas, transiciones entre senas, manos entrando o saliendo del encuadre, movimientos cotidianos que no son LSC y momentos de espera. No debe contener las senas que se quieren reconocer.
+- `__idle__/`: ejemplos de ausencia de sena. Incluye manos relajadas, transiciones entre senas, manos entrando o saliendo del encuadre, movimientos cotidianos que no son LSC y momentos de espera. No debe contener ninguna sena LSC valida o incompleta.
 
-La clase `nada` es muy recomendable: evita que el modelo fuerce una etiqueta como `hola` cuando no se esta haciendo ninguna sena conocida.
+`__idle__` es una clase tecnica de no-traduccion: nunca se muestra como palabra ni se reproduce por audio. Se evita el nombre `nada` porque este puede reservarse para la sena LSC que expresa esa palabra. Durante la carga, alias como `no_sign`, `neutral`, `idle` o `reposo` se normalizan internamente a `__idle__`.
+
+El entrenamiento cubre `__idle__` con ventanas densas a lo largo de todo el video. Asi aprende tambien las fases intermedias de un movimiento cotidiano que la ventana deslizante de la camara observara en tiempo real. Los pesos de clase compensan automaticamente la mayor cantidad de ventanas negativas.
 
 ### Recomendaciones para grabar
 
 - Usa clips de 1 a 2 segundos: reposo breve, una sena completa y reposo breve.
+- Para `__idle__`, usa clips de 2 a 5 segundos que contengan solo una situacion sin sena.
 - Manten ambas manos completas dentro del encuadre, con buena luz y fondo con contraste.
 - Graba entre 15 y 30 ejemplos por sena como base; mezcla distancias, velocidad, ropa, fondos y, cuando sea posible, distintas personas.
 - Repite una cantidad parecida de videos por etiqueta. Una clase con muchos mas ejemplos puede dominar las predicciones.
@@ -118,6 +121,25 @@ Al terminar, revisa en la terminal los bloques `Validacion por sena` y `Validaci
 
 ## Ejecutar la traduccion
 
+### Servicio para frontend web
+
+El frontend web usa el servicio WebSocket de este repositorio para enviar frames de la camara y recibir texto en tiempo real. Los videos nunca salen del navegador ni se guardan: cada frame se procesa en memoria y se descarta.
+
+Con el paquete compatible dentro de `model/`, inicia el servicio:
+
+```powershell
+python -m pip install -r requirements.txt
+python web_service.py
+```
+
+El servicio queda disponible en `http://localhost:8000` y expone `GET /health`, `GET /model-info` y `WS /ws/recognize`.
+
+Para permitir otro origen, configura `ALLOWED_ORIGINS` antes de iniciarlo. Ejemplo: `ALLOWED_ORIGINS=http://localhost:5173`.
+
+Para desarrollo en este equipo, abre el frontend en `http://localhost:5173`; los navegadores permiten usar la camara en `localhost`. Si se abre mediante una IP como `http://192.168.x.x:5173`, la camara sera bloqueada por el navegador porque esa direccion no usa HTTPS. Para pruebas desde otra maquina o un telefono, publica el frontend con HTTPS y agrega su origen `https://...` a `ALLOWED_ORIGINS` en un archivo `.env` basado en `.env.example`.
+
+Cuando se entrenen nuevas senas, publica juntos `lsc_sequence_model.keras`, `lsc_labels.json` y `lsc_config.json` dentro de `model/` y reinicia el servicio. El frontend recibe las etiquetas desde el servicio, por lo que no requiere una lista de senas quemada en codigo.
+
 ### Camara web
 
 ```powershell
@@ -139,13 +161,14 @@ python main.py --source ruta\al\video.mp4
 ### Opciones utiles
 
 ```powershell
-python main.py --threshold 0.65 --margin 0.12
+python main.py --threshold 0.70 --margin 0.12
 python main.py --no-speak
 python main.py --no-auto-speak
 ```
 
-- `--threshold`: confianza minima para aceptar una traduccion.
+- `--threshold`: confianza minima para aceptar una traduccion. Si se omite, se usa el valor guardado durante el entrenamiento.
 - `--margin`: diferencia minima entre la mejor prediccion y la segunda mejor. Aumentarlo reduce falsos positivos, pero puede tardar mas en confirmar una sena.
+- `--stable-predictions`: cantidad de predicciones consecutivas iguales necesarias para confirmar una traduccion.
 - `--no-speak`: inicia sin voz.
 - `--no-auto-speak`: muestra texto sin pronunciarlo automaticamente.
 
@@ -163,7 +186,7 @@ python main.py --no-auto-speak
 
 | Situacion | Que hacer |
 | --- | --- |
-| Todas las senas se convierten en `hola` | Agrega ejemplos variados de las otras clases, crea `nada/`, revisa videos mal etiquetados y reentrena. |
+| Todas las senas se convierten en `hola` | Agrega ejemplos variados de las otras clases, crea `__idle__/`, revisa videos mal etiquetados y reentrena. |
 | Una mano funciona y la otra se confunde | Entrena de nuevo con la version actual y agrega algunos ejemplos reales con la mano contraria. |
 | `mal` y `regular` se confunden | Revisa los clips de ambas clases, graba diferencias mas claras y equilibra la cantidad de videos. |
 | No aparece una traduccion | Mejora la luz, aleja un poco las manos para que se vean completas o baja cuidadosamente `--threshold`/`--margin`. |
@@ -173,7 +196,7 @@ python main.py --no-auto-speak
 
 ## Flujo de mejora recomendado
 
-1. Graba ejemplos limpios y balanceados de cada sena, incluida `nada`.
+1. Graba ejemplos limpios y balanceados de cada sena e incluye negativos variados en `__idle__`.
 2. Entrena y conserva la salida de validacion.
 3. Prueba la camara con clips nuevos y con ambas manos.
 4. Guarda los errores por pareja de senas, por ejemplo `mal` -> `hola`.
