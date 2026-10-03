@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import threading
 from collections import deque
@@ -45,6 +46,7 @@ from lsc_pipeline import (
 
 MAX_FRAME_BYTES = 1_500_000
 MISSING_HAND_RESET_FRAMES = 3
+logger = logging.getLogger(__name__)
 
 
 def _allowed_origins():
@@ -157,7 +159,10 @@ class RecognitionSession:
         self.missing_hand_frames = 0
         self.visible_hand_frames += 1
         self.sequence.append(features)
-        if len(self.sequence) < self.runtime.sequence_length or self.visible_hand_frames < MIN_VISIBLE_FRAMES:
+        # Training accepts variable-duration clips and resamples them to the
+        # model's fixed input length. Do the same live instead of waiting for
+        # all 32 source frames from a comparatively slow mobile camera.
+        if self.visible_hand_frames < MIN_VISIBLE_FRAMES:
             return self._response("analyzing")
 
         active_window = select_live_action_window(list(self.sequence), self.runtime.sequence_length)
@@ -211,6 +216,7 @@ def model_info():
 async def recognize(websocket: WebSocket):
     origin = websocket.headers.get("origin")
     if origin and "*" not in allowed_origins and origin not in allowed_origins:
+        logger.warning("WebSocket rejected for origin: %s", origin)
         await websocket.close(code=1008)
         return
 
