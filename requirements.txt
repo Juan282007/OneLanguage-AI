@@ -17,6 +17,7 @@ numpy==1.26.4
 opencv-python==4.11.0.86
 packaging==24.2
 pandas==2.2.3
+python-dotenv>=1.0,<2
 pyttsx3==2.98
 redis==5.2.1
 requests==2.32.3

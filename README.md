@@ -208,3 +208,26 @@ Para una aplicacion movil o web, no se envian las carpetas de entrenamiento al u
 ## Git y archivos locales
 
 El archivo `.gitignore` excluye el entorno virtual, los videos, los modelos generados, caches, bases de datos locales y configuraciones con posibles secretos. El repositorio debe contener el codigo, las dependencias y esta guia; los datos y modelos se manejan por separado como artefactos privados o publicados de forma controlada.
+## Ejecutar el servicio con Docker
+
+La imagen Docker ejecuta el servicio FastAPI/WebSocket de reconocimiento en CPU. Los videos de entrenamiento y los pesos no se copian a la imagen: el paquete compatible de `model/` se monta como volumen de solo lectura al iniciar el contenedor.
+
+1. Asegura que `model/` contenga `lsc_sequence_model.keras`, `lsc_labels.json` y `lsc_config.json` compatibles.
+2. Copia `.env.example` a `.env` y configura los origenes que usaran web o movil en `ALLOWED_ORIGINS`.
+3. Construye e inicia el servicio:
+
+   ```powershell
+   docker compose up --build -d
+   ```
+
+4. Comprueba que cargo el modelo:
+
+   ```powershell
+   Invoke-RestMethod http://localhost:8000/health
+   ```
+
+El WebSocket queda disponible en `ws://<IP-DEL-EQUIPO>:8000/ws/recognize`. Para detenerlo usa `docker compose down`; para ver los registros usa `docker compose logs -f ai-service`.
+
+Para actualizar un modelo entrenado, reemplaza los archivos dentro de `model/` por un paquete compatible y reinicia el servicio con `docker compose restart ai-service`. No es necesario reconstruir la imagen.
+
+Si el puerto 8000 ya esta ocupado por la ejecucion local de Python, detenla antes de iniciar Docker. Como alternativa temporal, define `AI_HOST_PORT=8001` en `.env`; en ese caso la URL del frontend debe usar el puerto 8001.
