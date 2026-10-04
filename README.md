@@ -119,6 +119,8 @@ Vuelve a entrenar cada vez que agregues, elimines o sustituyas videos, o despues
 
 Al terminar, revisa en la terminal los bloques `Validacion por sena` y `Validacion espejo`. Una precision alta con pocos clips no garantiza buen uso real: prueba tambien videos nuevos que no hayan participado en el entrenamiento.
 
+Para medir la experiencia de camara con videos reservados, ejecuta `python evaluate_live.py --data evaluation_videos --fps 5`. Esta prueba muestrea cada video, lo convierte a JPEG de 1280 px como la web y aplica las mismas reglas de confirmacion y reposo del servicio en vivo. Usa `--jpeg-width 0` para medir solo el efecto del muestreo temporal sin compresion; para otras camaras ajusta `--fps`, `--jpeg-width` y `--jpeg-quality`. Compara su resultado con `python evaluate_dataset.py --data evaluation_videos`: el segundo clasifica clips completos y suele dar una precision mayor. La prueba sigue siendo una aproximacion; valida tambien con la camara real, diferentes personas y fondos. No copies videos de `evaluation_videos/` a `videos/` antes de medir, porque dejaria de ser una prueba independiente.
+
 ## Ejecutar la traduccion
 
 ### Servicio para frontend web
@@ -226,7 +228,9 @@ La imagen Docker ejecuta el servicio FastAPI/WebSocket de reconocimiento en CPU.
    Invoke-RestMethod http://localhost:8000/health
    ```
 
-El WebSocket queda disponible en `ws://<IP-DEL-EQUIPO>:8000/ws/recognize`. Para detenerlo usa `docker compose down`; para ver los registros usa `docker compose logs -f ai-service`.
+El WebSocket queda disponible en `ws://<IP-DEL-EQUIPO>:<AI_HOST_PORT>/ws/recognize`. El puerto predeterminado es 8000; si `.env` define `AI_HOST_PORT=8001`, comprueba `http://localhost:8001/health` y usa el puerto 8001 en web y movil. Para detenerlo usa `docker compose down`; para ver los registros usa `docker compose logs -f ai-service`.
+
+El servicio usa por defecto 4 fotogramas visibles antes de inferir y 2 predicciones consecutivas para confirmar. Puedes ajustar `AI_LIVE_MINIMUM_FRAMES` y `AI_LIVE_STABLE_PREDICTIONS` en `.env` y reiniciar Docker; reduce los valores solo despues de medir los falsos positivos con `evaluate_live.py`.
 
 Para actualizar un modelo entrenado, reemplaza los archivos dentro de `model/` por un paquete compatible y reinicia el servicio con `docker compose restart ai-service`. No es necesario reconstruir la imagen.
 
