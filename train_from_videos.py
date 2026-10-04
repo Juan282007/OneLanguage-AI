@@ -94,11 +94,15 @@ def augment_sequence(sequence, rng):
 
 
 def mirror_sequence(sequence):
-    """Mirrors landmarks and swaps the left/right hand slots."""
+    """Mirrors two-handed samples; one-handed samples are already canonical."""
     sequence = np.asarray(sequence, dtype=np.float32)
     hands = sequence.reshape(sequence.shape[0], 2, 21, 3).copy()
-    hands = hands[:, [1, 0], :, :]
-    hands[..., 0] *= -1
+    visible = np.any(np.abs(hands) > 1e-6, axis=(2, 3))
+    two_handed_frames = visible[:, 0] & visible[:, 1]
+    if np.any(two_handed_frames):
+        mirrored = hands[two_handed_frames][:, [1, 0], :, :]
+        mirrored[..., 0] *= -1
+        hands[two_handed_frames] = mirrored
     return hands.reshape(sequence.shape)
 
 
@@ -374,7 +378,6 @@ def main():
             "windows_per_video": args.windows_per_video,
             "include_motion_features": include_motion_features,
             "feature_size": int(X_train.shape[2]),
-            "no_sign_label": NO_SIGN_LABEL,
             "confidence_threshold": args.inference_threshold,
             "minimum_margin": args.inference_margin,
             "stable_predictions": args.stable_predictions,

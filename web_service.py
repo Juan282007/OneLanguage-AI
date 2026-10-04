@@ -44,8 +44,11 @@ from lsc_pipeline import (
 )
 
 
-MAX_FRAME_BYTES = 1_500_000
-MISSING_HAND_RESET_FRAMES = 3
+MAX_FRAME_BYTES = 2_500_000
+# Keep a partial sequence while a palm turn momentarily loses hand tracking.
+MISSING_HAND_RESET_FRAMES = 6
+DEFAULT_LIVE_MINIMUM_FRAMES = MIN_VISIBLE_FRAMES
+DEFAULT_LIVE_STABLE_PREDICTIONS = DEFAULT_STABLE_PREDICTIONS
 logger = logging.getLogger(__name__)
 
 
@@ -79,7 +82,20 @@ class ModelRuntime:
         self.include_motion_features = bool(self.config.get("include_motion_features", False))
         self.confidence_threshold = float(self.config.get("confidence_threshold", DEFAULT_CONFIDENCE_THRESHOLD))
         self.minimum_margin = float(self.config.get("minimum_margin", DEFAULT_MINIMUM_MARGIN))
-        self.stable_predictions = max(1, int(self.config.get("stable_predictions", DEFAULT_STABLE_PREDICTIONS)))
+        self.stable_predictions = max(
+            1,
+            int(os.getenv(
+                "AI_LIVE_STABLE_PREDICTIONS",
+                self.config.get("live_stable_predictions", self.config.get("stable_predictions", DEFAULT_LIVE_STABLE_PREDICTIONS)),
+            )),
+        )
+        self.live_minimum_frames = max(
+            MIN_VISIBLE_FRAMES,
+            int(os.getenv(
+                "AI_LIVE_MINIMUM_FRAMES",
+                self.config.get("live_minimum_frames", DEFAULT_LIVE_MINIMUM_FRAMES),
+            )),
+        )
         expected_features = FEATURE_SIZE + (MOTION_FEATURE_SIZE if self.include_motion_features else 0)
 
         if int(self.model.input_shape[1]) != self.sequence_length:
@@ -100,6 +116,8 @@ class ModelRuntime:
             "model_version": self.config.get("model_version", "local"),
             "preprocessing_version": self.config.get("preprocessing_version"),
             "sequence_length": self.sequence_length,
+            "live_minimum_frames": self.live_minimum_frames,
+            "live_stable_predictions": self.stable_predictions,
             "labels": [_display_label(label) for label in self.labels if not is_no_sign_label(label)],
         }
 
@@ -118,6 +136,7 @@ class RecognitionSession:
         self.missing_hand_frames = 0
         self.visible_hand_frames = 0
         self.committed_label = None
+        self.committed_confidence = 0.0
 
     def close(self):
         self.extractor.close()
@@ -127,6 +146,7 @@ class RecognitionSession:
         self.predictions.clear()
         self.visible_hand_frames = 0
         self.committed_label = None
+        self.committed_confidence = 0.0
 
     def _response(self, status, confidence=0.0, label=None, is_new_translation=False):
         return {
@@ -149,12 +169,15 @@ class RecognitionSession:
         return self.process_frame(frame)
 
     def process_frame(self, frame):
-        features = self.extractor.frame_features(frame)
+        return self.process_features(self.extractor.frame_features(frame))
+
+    def process_features(self, features):
         if not np.any(np.abs(features) > 1e-5):
             self.missing_hand_frames += 1
             if self.missing_hand_frames >= MISSING_HAND_RESET_FRAMES:
                 self._reset()
-            return self._response("no_hands")
+                return self._response("no_hands")
+            return self._response("analyzing")
 
         self.missing_hand_frames = 0
         self.visible_hand_frames += 1
@@ -162,7 +185,7 @@ class RecognitionSession:
         # Training accepts variable-duration clips and resamples them to the
         # model's fixed input length. Do the same live instead of waiting for
         # all 32 source frames from a comparatively slow mobile camera.
-        if self.visible_hand_frames < MIN_VISIBLE_FRAMES:
+        if self.visible_hand_frames < self.runtime.live_minimum_frames:
             return self._response("analyzing")
 
         active_window = select_live_action_window(list(self.sequence), self.runtime.sequence_length)
@@ -176,10 +199,14 @@ class RecognitionSession:
         if is_no_sign_label(raw_label):
             self._reset()
             return self._response("idle", confidence)
+        if self.committed_label is not None:
+            return self._response("translated", self.committed_confidence, self.committed_label)
         if confidence < self.runtime.confidence_threshold or margin < self.runtime.minimum_margin:
             self.predictions.clear()
             return self._response("waiting", confidence)
 
+        # An isolated-sign model needs a neutral gap before starting another word.
+        # This prevents adjacent windows of one gesture becoming several translations.
         self.predictions.append(raw_label)
         is_stable = len(self.predictions) == self.runtime.stable_predictions and len(set(self.predictions)) == 1
         if not is_stable:
@@ -187,6 +214,7 @@ class RecognitionSession:
 
         is_new_translation = raw_label != self.committed_label
         self.committed_label = raw_label
+        self.committed_confidence = confidence
         return self._response("translated", confidence, raw_label, is_new_translation)
 
 
@@ -229,6 +257,7 @@ async def recognize(websocket: WebSocket):
             try:
                 prediction = await asyncio.to_thread(session.process_encoded_frame, payload)
             except ValueError as error:
+                logger.warning("Invalid camera frame: %s", error)
                 prediction = {"type": "error", "message": str(error)}
             await websocket.send_json(prediction)
     except WebSocketDisconnect:

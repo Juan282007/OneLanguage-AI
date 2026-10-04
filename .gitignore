@@ -24,6 +24,8 @@ venv_damaged_*/
 videos/
 data/
 datasets/
+evaluation_videos/
+dataset_v2/
 
 # Generated machine-learning artifacts
 model/

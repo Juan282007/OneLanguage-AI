@@ -135,7 +135,9 @@ class Speaker:
 
 
 class SignRecognizer(BaseSignRecognizer):
-    MISSING_HAND_RESET_FRAMES = 3
+    # Palm rotations can briefly make MediaPipe lose a hand. Keep the current
+    # movement buffer long enough to classify a continuous rotational sign.
+    MISSING_HAND_RESET_FRAMES = 6
 
     def __init__(
         self,
@@ -364,7 +366,8 @@ class SignRecognizer(BaseSignRecognizer):
             self.missing_hand_frames += 1
             if self.missing_hand_frames >= self.MISSING_HAND_RESET_FRAMES:
                 self._reset_recognition()
-            return "Muestra las manos", 0.0, False, False
+                return "Muestra las manos", 0.0, False, False
+            return "Analizando...", 0.0, False, False
 
         self.missing_hand_frames = 0
         self.visible_hand_frames += 1

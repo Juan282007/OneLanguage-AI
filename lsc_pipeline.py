@@ -14,7 +14,7 @@ FEATURE_SIZE = MAX_HANDS * LANDMARKS_PER_HAND * COORDINATES_PER_LANDMARK
 MOTION_FEATURE_SIZE = FEATURE_SIZE
 MIN_VISIBLE_FRAMES = 10
 SMOOTHING_ALPHA = 0.65
-PREPROCESSING_VERSION = 4
+PREPROCESSING_VERSION = 5
 NO_SIGN_LABEL = "__idle__"
 NO_SIGN_ALIASES = frozenset(
     {
@@ -94,14 +94,12 @@ class Preprocessor:
 
         left = np.zeros((LANDMARKS_PER_HAND, COORDINATES_PER_LANDMARK), dtype=np.float32)
         right = np.zeros((LANDMARKS_PER_HAND, COORDINATES_PER_LANDMARK), dtype=np.float32)
-        left_assigned = False
-        right_assigned = False
-        unassigned = []
 
         if not results.multi_hand_landmarks:
             return np.concatenate([left.flatten(), right.flatten()])
 
         handedness = results.multi_handedness or []
+        detected_hands = []
         for index, hand_landmarks in enumerate(results.multi_hand_landmarks[:MAX_HANDS]):
             label = None
             if index < len(handedness):
@@ -114,6 +112,22 @@ class Preprocessor:
                 # It now preserves the hand trajectory across the sequence.
                 points[0] = self._normalize_wrist(raw_points[0])
 
+            detected_hands.append((label, points))
+
+        if len(detected_hands) == 1:
+            # A one-handed sign has one semantic representation regardless of
+            # the hand used. A right hand is mirrored into the left-hand frame
+            # and always stored in the first slot.
+            label, points = detected_hands[0]
+            if label == "Right":
+                points = self._mirror_hand(points)
+            left = points
+            return np.concatenate([left.flatten(), right.flatten()])
+
+        left_assigned = False
+        right_assigned = False
+        unassigned = []
+        for label, points in detected_hands:
             if label == "Left" and not left_assigned:
                 left = points
                 left_assigned = True
@@ -154,6 +168,12 @@ class Preprocessor:
         # Center x/y so horizontal mirroring only needs to invert x.
         return np.array([wrist[0] - 0.5, wrist[1] - 0.5, wrist[2]], dtype=np.float32)
 
+    @staticmethod
+    def _mirror_hand(points):
+        """Reflects a normalized one-handed sign around its vertical axis."""
+        mirrored = points.copy()
+        mirrored[:, 0] *= -1
+        return mirrored
 
 # Kept as an alias for scripts that still import the previous public name.
 LandmarkExtractor = Preprocessor
