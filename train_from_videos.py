@@ -24,6 +24,9 @@ from lsc_pipeline import (
 
 VIDEO_EXTENSIONS = {".avi", ".mov", ".mp4", ".mkv", ".webm"}
 IGNORED_DATASET_DIRECTORIES = {"__MACOSX", "__pycache__"}
+# These signs use their location/direction relative to the signer as part of
+# their meaning, so artificial camera translation would make them overlap.
+POSITION_SENSITIVE_LABELS = frozenset({"yo", "tu", "el", "ella"})
 
 
 def collect_videos(dataset_dir):
@@ -72,7 +75,7 @@ def build_model(sequence_length, feature_size, num_classes):
     return model
 
 
-def augment_sequence(sequence, rng):
+def augment_sequence(sequence, rng, include_camera_shift=True):
     augmented = sequence.copy()
 
     speed = rng.uniform(0.85, 1.15)
@@ -85,6 +88,15 @@ def augment_sequence(sequence, rng):
 
     scale = rng.uniform(0.92, 1.08)
     augmented *= scale
+
+    if include_camera_shift:
+        # The wrist landmark stores camera-relative trajectory. Shift it
+        # slightly so non-spatial signs do not depend on one camera framing.
+        hands = augmented.reshape(augmented.shape[0], 2, 21, 3)
+        visible = np.any(np.abs(hands) > 1e-6, axis=(2, 3))
+        camera_shift = rng.uniform(-0.025, 0.025, size=2).astype(np.float32)
+        wrist_positions = hands[:, :, 0, :2]
+        wrist_positions[visible] += camera_shift
 
     noise = rng.normal(0, 0.01, size=augmented.shape).astype(np.float32)
     # Keep missing-hand coordinates at zero. Adding noise there creates fake hands.
@@ -106,13 +118,20 @@ def mirror_sequence(sequence):
     return hands.reshape(sequence.shape)
 
 
-def expand_with_augmentation(X, y, augmentations, include_mirror=True):
+def expand_with_augmentation(
+    X,
+    y,
+    augmentations,
+    position_sensitive_ids,
+    include_mirror=True,
+):
     """Adds realistic timing/noise variants and optional opposite-hand variants."""
     rng = np.random.default_rng(42)
     expanded_X = []
     expanded_y = []
 
     for sample, label in zip(X, y):
+        include_camera_shift = int(label) not in position_sensitive_ids
         variants = [sample]
         if include_mirror:
             variants.append(mirror_sequence(sample))
@@ -121,7 +140,7 @@ def expand_with_augmentation(X, y, augmentations, include_mirror=True):
             expanded_X.append(variant)
             expanded_y.append(label)
             for _ in range(augmentations):
-                expanded_X.append(augment_sequence(variant, rng))
+                expanded_X.append(augment_sequence(variant, rng, include_camera_shift=include_camera_shift))
                 expanded_y.append(label)
 
     return np.asarray(expanded_X, dtype=np.float32), np.asarray(expanded_y, dtype=np.int64)
@@ -227,6 +246,9 @@ def main():
         )
 
     label_to_index = {label: index for index, label in enumerate(labels)}
+    position_sensitive_ids = {
+        label_to_index[label] for label in POSITION_SENSITIVE_LABELS if label in label_to_index
+    }
 
     extractor = LandmarkExtractor()
     windows_by_video, video_labels = [], []
@@ -290,6 +312,7 @@ def main():
             X_train_raw,
             y_train_raw,
             args.augmentations,
+            position_sensitive_ids,
             include_mirror=not args.no_mirror_augmentation,
         )
         validation_data = (X_val, y_val)
@@ -307,6 +330,7 @@ def main():
             X_train_raw,
             y_train_raw,
             args.augmentations,
+            position_sensitive_ids,
             include_mirror=not args.no_mirror_augmentation,
         )
         validation_data = None
