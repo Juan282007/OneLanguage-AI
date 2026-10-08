@@ -37,7 +37,9 @@ from lsc_pipeline import (
     MIN_VISIBLE_FRAMES,
     MODEL_PATH,
     MOTION_FEATURE_SIZE,
+    SEQUENCE_LENGTH,
     Preprocessor,
+    format_label,
     is_no_sign_label,
     load_model_config,
     select_live_action_window,
@@ -46,9 +48,13 @@ from lsc_pipeline import (
 
 MAX_FRAME_BYTES = 2_500_000
 # Keep a partial sequence while a palm turn momentarily loses hand tracking.
-MISSING_HAND_RESET_FRAMES = 6
+MISSING_HAND_RESET_FRAMES = 12
+# Live clients submit one frame at a time. Keep the confirmation short enough
+# for mobile while still requiring more than a single isolated frame.
 DEFAULT_LIVE_MINIMUM_FRAMES = MIN_VISIBLE_FRAMES
-DEFAULT_LIVE_STABLE_PREDICTIONS = DEFAULT_STABLE_PREDICTIONS
+DEFAULT_LIVE_STABLE_PREDICTIONS = 2
+MINIMUM_VISIBLE_FRAMES_BY_LABEL = {"como-estas": 14}
+STABLE_PREDICTIONS_BY_LABEL = {"el": 2}
 logger = logging.getLogger(__name__)
 
 
@@ -58,7 +64,7 @@ def _allowed_origins():
 
 
 def _display_label(label):
-    return str(label).replace("-", " ").replace("_", " ").strip()
+    return format_label(label)
 
 
 def _prediction_margin(probabilities):
@@ -131,7 +137,7 @@ class RecognitionSession:
             include_wrist_trajectory=bool(runtime.config.get("uses_wrist_trajectory", False)),
             include_motion_features=runtime.include_motion_features,
         )
-        self.sequence = deque(maxlen=runtime.sequence_length * 2)
+        self.sequence = deque(maxlen=runtime.sequence_length * 3)
         self.predictions = deque(maxlen=runtime.stable_predictions)
         self.missing_hand_frames = 0
         self.visible_hand_frames = 0
@@ -205,10 +211,20 @@ class RecognitionSession:
             self.predictions.clear()
             return self._response("waiting", confidence)
 
+        required_visible_frames = MINIMUM_VISIBLE_FRAMES_BY_LABEL.get(raw_label, self.runtime.live_minimum_frames)
+        if self.visible_hand_frames < required_visible_frames:
+            self.predictions.clear()
+            return self._response("analyzing", confidence, raw_label)
+
         # An isolated-sign model needs a neutral gap before starting another word.
         # This prevents adjacent windows of one gesture becoming several translations.
         self.predictions.append(raw_label)
-        is_stable = len(self.predictions) == self.runtime.stable_predictions and len(set(self.predictions)) == 1
+        required_stability = min(
+            self.runtime.stable_predictions,
+            STABLE_PREDICTIONS_BY_LABEL.get(raw_label, self.runtime.stable_predictions),
+        )
+        stable_labels = list(self.predictions)[-required_stability:]
+        is_stable = len(stable_labels) == required_stability and len(set(stable_labels)) == 1
         if not is_stable:
             return self._response("analyzing", confidence, raw_label)
 

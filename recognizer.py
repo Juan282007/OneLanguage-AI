@@ -22,6 +22,7 @@ from lsc_pipeline import (
     MOTION_FEATURE_SIZE,
     SEQUENCE_LENGTH,
     Preprocessor,
+    format_label,
     is_no_sign_label,
     load_model_config,
     open_video_capture,
@@ -137,7 +138,9 @@ class Speaker:
 class SignRecognizer(BaseSignRecognizer):
     # Palm rotations can briefly make MediaPipe lose a hand. Keep the current
     # movement buffer long enough to classify a continuous rotational sign.
-    MISSING_HAND_RESET_FRAMES = 6
+    MISSING_HAND_RESET_FRAMES = 12
+    MINIMUM_VISIBLE_FRAMES_BY_LABEL = {"como-estas": 14}
+    STABLE_PREDICTIONS_BY_LABEL = {"el": 2}
 
     def __init__(
         self,
@@ -160,7 +163,7 @@ class SignRecognizer(BaseSignRecognizer):
         self.auto_speak = auto_speak
         self.speaker = Speaker()
         self.speaker.enabled = bool(speak and self.speaker.available)
-        self.sequence = deque(maxlen=SEQUENCE_LENGTH * 2)
+        self.sequence = deque(maxlen=SEQUENCE_LENGTH * 3)
         self.committed_label = None
         self.missing_hand_frames = 0
         self.visible_hand_frames = 0
@@ -177,7 +180,7 @@ class SignRecognizer(BaseSignRecognizer):
                 include_wrist_trajectory=uses_wrist_trajectory,
                 include_motion_features=self.include_motion_features,
             )
-            self.sequence = deque(maxlen=self.sequence_length * 2)
+            self.sequence = deque(maxlen=self.sequence_length * 3)
             self._validate_model_contract()
             print("Cargando modelo temporal entrenado con videos...")
             if not uses_wrist_trajectory:
@@ -281,7 +284,7 @@ class SignRecognizer(BaseSignRecognizer):
     @staticmethod
     def _display_label(label):
         """Converts dataset-safe folder labels into text suitable for people."""
-        return str(label).replace("-", " ").replace("_", " ").strip()
+        return format_label(label)
 
     @staticmethod
     def _prediction_margin(prediction):
@@ -346,13 +349,23 @@ class SignRecognizer(BaseSignRecognizer):
             self.predictions.clear()
             return "Esperando sena...", confidence, False, False
 
+        required_visible_frames = self.MINIMUM_VISIBLE_FRAMES_BY_LABEL.get(raw_label, MIN_VISIBLE_FRAMES)
+        if self.visible_hand_frames < required_visible_frames:
+            self.predictions.clear()
+            return f"Detectando: {label}", confidence, False, False
+
         self.predictions.append((raw_label, confidence))
         recent_labels = [recent_label for recent_label, _ in self.predictions]
-        is_stable = len(recent_labels) == self.stable_predictions and len(set(recent_labels)) == 1
+        required_stability = min(
+            self.stable_predictions,
+            self.STABLE_PREDICTIONS_BY_LABEL.get(raw_label, self.stable_predictions),
+        )
+        stable_labels = recent_labels[-required_stability:]
+        is_stable = len(stable_labels) == required_stability and len(set(stable_labels)) == 1
         if not is_stable:
             return f"Detectando: {label}", confidence, False, False
 
-        stable_confidence = float(np.mean([value for _, value in self.predictions]))
+        stable_confidence = float(np.mean([value for _, value in self.predictions][-required_stability:]))
         is_new_translation = raw_label != self.committed_label
         self.committed_label = raw_label
         return label, stable_confidence, is_new_translation, True

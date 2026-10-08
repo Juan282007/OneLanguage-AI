@@ -14,7 +14,7 @@ FEATURE_SIZE = MAX_HANDS * LANDMARKS_PER_HAND * COORDINATES_PER_LANDMARK
 MOTION_FEATURE_SIZE = FEATURE_SIZE
 MIN_VISIBLE_FRAMES = 10
 SMOOTHING_ALPHA = 0.65
-PREPROCESSING_VERSION = 5
+PREPROCESSING_VERSION = 7
 NO_SIGN_LABEL = "__idle__"
 NO_SIGN_ALIASES = frozenset(
     {
@@ -32,6 +32,21 @@ NO_SIGN_ALIASES = frozenset(
 DEFAULT_CONFIDENCE_THRESHOLD = 0.70
 DEFAULT_MINIMUM_MARGIN = 0.12
 DEFAULT_STABLE_PREDICTIONS = 4
+DISPLAY_LABELS = {
+    "bien": "Bien",
+    "buenas-noches": "Buenas noches",
+    "buenas-tardes": "Buenas tardes",
+    "buenos-dias": "Buenos días",
+    "como-estas": "Cómo estás",
+    "el": "Él",
+    "ella": "Ella",
+    "gracias": "Gracias",
+    "hola": "Hola",
+    "mal": "Mal",
+    "regular": "Regular",
+    "tu": "Tú",
+    "yo": "Yo",
+}
 MODEL_PATH = Path("model/lsc_sequence_model.keras")
 LABELS_PATH = Path("model/lsc_labels.json")
 CONFIG_PATH = Path("model/lsc_config.json")
@@ -48,6 +63,16 @@ def is_no_sign_label(label):
 def canonicalize_label(label):
     """Maps supported neutral aliases to one stable model label."""
     return NO_SIGN_LABEL if is_no_sign_label(label) else str(label).strip()
+
+
+def format_label(label):
+    """Returns a dataset label as readable Spanish without changing its ID."""
+    token = str(label).strip()
+    if token in DISPLAY_LABELS:
+        return DISPLAY_LABELS[token]
+
+    text = token.replace("-", " ").replace("_", " ").strip()
+    return text[:1].upper() + text[1:] if text else text
 
 
 def open_video_capture(source):
@@ -77,19 +102,29 @@ class Preprocessor:
         self.include_wrist_trajectory = include_wrist_trajectory
         self.include_motion_features = include_motion_features
         self.mp_hands = mp.solutions.hands
+        self.mp_pose = mp.solutions.pose
         self.hands = self.mp_hands.Hands(
             static_image_mode=False,
             max_num_hands=max_num_hands,
             min_detection_confidence=min_detection_confidence,
             min_tracking_confidence=min_tracking_confidence,
         )
+        self.pose = self.mp_pose.Pose(
+            static_image_mode=False,
+            model_complexity=0,
+            enable_segmentation=False,
+            min_detection_confidence=min_detection_confidence,
+            min_tracking_confidence=min_tracking_confidence,
+        )
 
     def close(self):
         self.hands.close()
+        self.pose.close()
 
     def frame_features(self, frame):
         image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         image.flags.writeable = False
+        body_reference = self._body_reference(self.pose.process(image))
         results = self.hands.process(image)
 
         left = np.zeros((LANDMARKS_PER_HAND, COORDINATES_PER_LANDMARK), dtype=np.float32)
@@ -109,8 +144,9 @@ class Preprocessor:
             points = self._normalize_hand(raw_points)
             if self.include_wrist_trajectory:
                 # Landmark 0 was always (0, 0, 0) after local normalization.
-                # It now preserves the hand trajectory across the sequence.
-                points[0] = self._normalize_wrist(raw_points[0])
+                # It preserves trajectory relative to the shoulders when pose
+                # is visible, avoiding dependence on camera framing.
+                points[0] = self._normalize_wrist(raw_points[0], body_reference)
 
             detected_hands.append((label, points))
 
@@ -164,8 +200,30 @@ class Preprocessor:
         return points
 
     @staticmethod
-    def _normalize_wrist(wrist):
-        # Center x/y so horizontal mirroring only needs to invert x.
+    def _body_reference(pose_results):
+        if not pose_results.pose_landmarks:
+            return None
+
+        landmarks = pose_results.pose_landmarks.landmark
+        left = landmarks[mp.solutions.pose.PoseLandmark.LEFT_SHOULDER]
+        right = landmarks[mp.solutions.pose.PoseLandmark.RIGHT_SHOULDER]
+        shoulder_width = float(np.hypot(left.x - right.x, left.y - right.y))
+        if shoulder_width <= 1e-4:
+            return None
+        center = np.array(
+            [(left.x + right.x) / 2, (left.y + right.y) / 2, (left.z + right.z) / 2],
+            dtype=np.float32,
+        )
+        return center, shoulder_width
+
+    @staticmethod
+    def _normalize_wrist(wrist, body_reference=None):
+        # A body-relative wrist position retains the meaningful location of
+        # pronouns while being robust to camera translation and distance.
+        if body_reference is not None:
+            center, shoulder_width = body_reference
+            return ((wrist - center) / shoulder_width).astype(np.float32)
+        # Fallback for close hand-only frames where shoulders are not visible.
         return np.array([wrist[0] - 0.5, wrist[1] - 0.5, wrist[2]], dtype=np.float32)
 
     @staticmethod
@@ -312,20 +370,29 @@ def _window_starts(sequence, target_length, windows_per_video):
 
 
 def select_action_windows(sequence, target_length=SEQUENCE_LENGTH, windows_per_video=3):
-    """Creates fixed-size high-motion windows equivalent to the live camera buffer."""
+    """Creates full-action and high-motion views of a variable-length sign.
+
+    The full-action view preserves long gestures whose meaning depends on the
+    order of the movement. High-motion views remain useful as augmentation for
+    short signs and for variations in the start/end timing.
+    """
     sequence = _trim_to_visible_hands(np.asarray(sequence, dtype=np.float32))
     if len(sequence) < MIN_VISIBLE_FRAMES:
         return []
     if len(sequence) <= target_length:
         return [resample_sequence(sequence, target_length)]
-    return [sequence[start : start + target_length] for start in _window_starts(sequence, target_length, windows_per_video)]
+
+    windows = [resample_sequence(sequence, target_length)]
+    for start in _window_starts(sequence, target_length, windows_per_video):
+        window = sequence[start : start + target_length]
+        if not any(np.array_equal(window, existing) for existing in windows):
+            windows.append(window)
+    return windows
 
 
 def select_live_action_window(sequence, target_length=SEQUENCE_LENGTH):
-    """Selects the most active current window using the same rule as training."""
-    windows = select_action_windows(sequence, target_length=target_length, windows_per_video=1)
-    if windows:
-        return windows[0]
+    """Preserves the visible gesture chronology for real-time recognition."""
+    sequence = _trim_to_visible_hands(np.asarray(sequence, dtype=np.float32))
     return resample_sequence(sequence, target_length)
 
 
@@ -390,7 +457,7 @@ def save_metadata(labels, sequence_length=SEQUENCE_LENGTH, extra_metadata=None):
         "feature_size": FEATURE_SIZE,
         "preprocessing_version": PREPROCESSING_VERSION,
         "uses_wrist_trajectory": True,
-        "input_window": "active_32_frame_window",
+        "input_window": "full_visible_action_resampled_to_32",
     }
     if extra_metadata:
         metadata.update(extra_metadata)
