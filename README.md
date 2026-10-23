@@ -98,7 +98,7 @@ Como `videos/` y `model/` no se versionan, al clonar se debe hacer una de estas 
 1. Crear o copiar el dataset local en `videos/` y entrenar el modelo.
 2. Instalar el paquete versionado del modelo con `python scripts/install_model.py`. El instalador verifica SHA-256 y la compatibilidad de los tres archivos antes de colocarlos en `model/`.
 
-El instalador remoto espera `onelanguage-lsc-model-v1.0.0.zip` como asset de la release `lsc-v1.0.0` de este repositorio; esa release debe publicarse antes de usarlo desde un clon limpio. Si ya descargaste el ZIP, puedes instalarlo sin red con `python scripts/install_model.py --archive ruta/al/archivo.zip`. Para publicar una version nueva desde los tres artefactos locales compatibles, ejecuta `python scripts/package_model.py`; sube el ZIP resultante de `dist/` como asset de la release y actualiza la URL y el SHA-256 fijados en `scripts/install_model.py`. No incluyas los pesos en Git.
+El instalador remoto descarga `onelanguage-lsc-model-v1.0.0.zip` desde la release `lsc-v1.0.0` de este repositorio. Si ya descargaste el ZIP, puedes instalarlo sin red con `python scripts/install_model.py --archive ruta/al/archivo.zip`. Para publicar una version nueva desde los tres artefactos locales compatibles, ejecuta `python scripts/package_model.py`; sube el ZIP resultante de `dist/` como asset de la release y actualiza la URL y el SHA-256 fijados en `scripts/install_model.py`. No incluyas los pesos en Git.
 
 ## Entrenar el modelo
 
