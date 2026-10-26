@@ -16,6 +16,10 @@ VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv"}
 
 
 def read_camera_features(path, extractor, target_fps, jpeg_width, jpeg_quality):
+    # BLOQUE: simulacion de la transmision de camara.
+    # Simula el trayecto real web/mobile: reduce FPS, aplica JPEG opcional y
+    # extrae landmarks despues de esa perdida de calidad. El objetivo es medir
+    # la experiencia que recibe el modelo en red, no solo el video ideal local.
     capture = open_video_capture(str(path))
     frames = []
     try:
@@ -27,6 +31,8 @@ def read_camera_features(path, extractor, target_fps, jpeg_width, jpeg_quality):
             if not ok:
                 break
             if index % step == 0:
+                # Esta compresion reproduce el frame que suele viajar por el
+                # WebSocket, no el video original sin transformar.
                 if jpeg_width:
                     height, width = frame.shape[:2]
                     target_width = min(width, jpeg_width)
@@ -46,6 +52,9 @@ def read_camera_features(path, extractor, target_fps, jpeg_width, jpeg_quality):
 
 
 def main():
+    # BLOQUE: configuracion de prueba realista.
+    # Define frecuencia de frames y compresion JPEG, despues valida limites para
+    # que una prueba invalida no produzca resultados enganosos.
     parser = argparse.ArgumentParser(description="Evalua reconocimiento temporal simulando una camara lenta.")
     parser.add_argument("--data", default="evaluation_videos")
     parser.add_argument("--fps", type=float, default=5.0, help="Fotogramas enviados por segundo (aproximado).")
@@ -57,10 +66,16 @@ def main():
     if args.jpeg_width < 0 or not 0 <= args.jpeg_quality <= 100:
         parser.error("--jpeg-width debe ser >= 0 y --jpeg-quality debe estar entre 0 y 100")
 
+    # BLOQUE: seleccion de videos reservados.
+    # Los videos deben estar separados del entrenamiento para medir generalizacion
+    # y deben organizarse por carpeta con la etiqueta esperada.
     samples = sorted(path for path in Path(args.data).glob("*/*") if path.suffix.lower() in VIDEO_EXTENSIONS)
     if not samples:
         parser.error(f"No encontre videos etiquetados en {args.data}")
 
+    # BLOQUE: reproduccion del contrato de produccion.
+    # Reutiliza el mismo preprocesador y configuracion del servicio web para que
+    # el experimento no use una ruta distinta a la que atiende web/mobile.
     extractor = Preprocessor(
         include_wrist_trajectory=bool(runtime.config.get("uses_wrist_trajectory", False)),
         include_motion_features=runtime.include_motion_features,
@@ -68,6 +83,10 @@ def main():
     results = defaultdict(list)
     try:
         for index, path in enumerate(samples, 1):
+            # BLOQUE: reproduccion temporal por clip.
+            # Cada video se entrega frame por frame a una sesion independiente,
+            # igual que ocurriria con un navegador conectado al WebSocket. Esto
+            # mide tambien la espera de frames y la confirmacion consecutiva.
             features = read_camera_features(path, extractor, args.fps, args.jpeg_width, args.jpeg_quality)
             session = RecognitionSession(runtime)
             translations = []
@@ -79,6 +98,9 @@ def main():
             finally:
                 session.close()
 
+            # BLOQUE: criterio de acierto de experiencia en vivo.
+            # Se compara la lista completa de traducciones para detectar omisiones,
+            # traducciones repetidas y falsos positivos, no solo la clase maxima.
             expected = [] if is_no_sign_label(path.parent.name) else [path.parent.name]
             correct = translations == expected
             results[path.parent.name].append(correct)
@@ -87,6 +109,7 @@ def main():
     finally:
         extractor.close()
 
+    # Reporte final por etiqueta y total bajo condiciones cercanas a produccion.
     print(f"\nReproduccion aproximada a {args.fps:g} fps, JPEG {args.jpeg_width}px calidad {args.jpeg_quality} (incluye espera y confirmacion):")
     for label, decisions in sorted(results.items()):
         print(f"  {label}: {sum(decisions)}/{len(decisions)}")
@@ -95,4 +118,5 @@ def main():
 
 
 if __name__ == "__main__":
+    # Ejecuta la simulacion solo cuando se llama este archivo directamente.
     main()
