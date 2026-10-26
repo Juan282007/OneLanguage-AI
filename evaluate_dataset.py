@@ -23,11 +23,18 @@ VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv"}
 
 
 def main():
+    # BLOQUE: configuracion de la auditoria.
+    # Permite revisar todas las etiquetas o concentrarse en una clase objetivo
+    # para descubrir de que senas provienen sus falsos positivos.
     parser = argparse.ArgumentParser(description="Evalua el modelo LSC con videos etiquetados.")
     parser.add_argument("--data", default="videos", help="Carpeta videos/<etiqueta>/*.mp4")
     parser.add_argument("--target", help="Muestra de que clases provienen las predicciones de esta etiqueta.")
     args = parser.parse_args()
 
+    # BLOQUE: carga de material de evaluacion.
+    # Descubre clips etiquetados y carga pesos, etiquetas y configuracion del
+    # paquete. El dataset de evaluacion debe estar separado del de entrenamiento
+    # para que el resultado represente capacidad de generalizacion.
     data_dir = Path(args.data)
     samples = sorted(path for path in data_dir.glob("*/*") if path.suffix.lower() in VIDEO_EXTENSIONS)
     if not samples:
@@ -43,9 +50,15 @@ def main():
         include_motion_features=include_motion_features,
     )
 
+    # BLOQUE: ejecucion por video.
+    # Cada fila conserva etiqueta real, prediccion y confianza para el reporte.
+    # El extractor se comparte para evitar inicializar MediaPipe una vez por clip.
     results = []
     try:
         for index, path in enumerate(samples, start=1):
+            # Convierte el clip a landmarks, elige una ventana representativa y
+            # aplica exactamente el mismo contrato de caracteristicas que recibio
+            # la red durante entrenamiento.
             windows = extract_video_sequences(path, extractor, sequence_length, windows_per_video=1)
             if not windows:
                 results.append((path.parent.name, "<sin_manos>", 0.0))
@@ -55,6 +68,8 @@ def main():
                 sequence_length,
                 include_motion_features=include_motion_features,
             )
+            # Si hay varias ventanas, se promedian probabilidades antes de escoger
+            # la clase final. Asi un fragmento corto no domina todo el video.
             probabilities = model.predict(sequences, verbose=0).mean(axis=0)
             predicted = labels[int(np.argmax(probabilities))]
             results.append((path.parent.name, predicted, float(np.max(probabilities))))
@@ -62,6 +77,10 @@ def main():
     finally:
         extractor.close()
 
+    # BLOQUE: consolidacion del reporte.
+    # Agrupa resultados por etiqueta real para revelar precision, confianza media
+    # y distribucion de predicciones; una unica precision global ocultaria clases
+    # que funcionan mal aunque otras funcionen muy bien.
     grouped = defaultdict(list)
     for actual, predicted, confidence in results:
         grouped[actual].append((predicted, confidence))
@@ -77,6 +96,8 @@ def main():
         print(f"  {actual}: {correct}/{len(rows)} ({correct / len(rows):.0%}), "
               f"confianza media={average_confidence:.0%}; {predictions}")
 
+    # Consulta inversa: identifica de que clases provienen las predicciones
+    # que terminaron clasificadas como una etiqueta objetivo.
     if args.target:
         print(f"\nVideos clasificados como '{args.target}'")
         for actual in sorted(grouped):
@@ -86,4 +107,5 @@ def main():
 
 
 if __name__ == "__main__":
+    # Ejecuta el reporte solo como script principal.
     main()
