@@ -22,6 +22,11 @@ from lsc_pipeline import (
 )
 
 
+# BLOQUE: reglas de entrada del entrenamiento.
+# Solo se recorren extensiones de video conocidas y se ignoran directorios que
+# no representan una sena. POSITION_SENSITIVE_LABELS protege clases donde la
+# ubicacion o direccion respecto al firmante tiene significado: desplazar esos
+# datos artificialmente podria convertir dos senas distintas en la misma forma.
 VIDEO_EXTENSIONS = {".avi", ".mov", ".mp4", ".mkv", ".webm"}
 IGNORED_DATASET_DIRECTORIES = {"__MACOSX", "__pycache__"}
 # These signs use their location/direction relative to the signer as part of
@@ -30,6 +35,10 @@ POSITION_SENSITIVE_LABELS = frozenset({"yo", "tu", "el", "ella"})
 
 
 def collect_videos(dataset_dir):
+    # BLOQUE: descubrimiento del dataset.
+    # Recorre una carpeta por etiqueta y devuelve pares (ruta, etiqueta). No
+    # carga aun los videos: primero valida que la estructura sea correcta y deja
+    # la extraccion pesada de landmarks para el bloque posterior.
     dataset_dir = Path(dataset_dir)
     if not dataset_dir.is_dir():
         raise SystemExit(f"No existe la carpeta de datos: {dataset_dir}")
@@ -50,6 +59,12 @@ def collect_videos(dataset_dir):
 
 
 def build_model(sequence_length, feature_size, num_classes):
+    # BLOQUE: definicion de la red neuronal.
+    # Masking ignora pasos totalmente vacios. La primera BiLSTM observa patrones
+    # cortos y conserva una salida por frame; la segunda resume el gesto entero.
+    # Dense aprende combinaciones no lineales de esos patrones y Softmax entrega
+    # una probabilidad por etiqueta. L2 y Dropout limitan que la red memorice los
+    # videos disponibles en vez de aprender variaciones generalizables.
     regularizer = tf.keras.regularizers.l2(1e-4)
     model = tf.keras.Sequential(
         [
@@ -76,6 +91,11 @@ def build_model(sequence_length, feature_size, num_classes):
 
 
 def augment_sequence(sequence, rng, include_camera_shift=True):
+    # BLOQUE: aumento sintetico de una muestra.
+    # Crea variaciones moderadas de velocidad, escala, encuadre y ruido para
+    # reducir sobreajuste. Los cambios son pequenos para conservar el significado
+    # de la sena. No se introduce ruido donde no hay mano porque eso simularia
+    # landmarks inexistentes y ensenaria datos falsos al clasificador.
     augmented = sequence.copy()
 
     speed = rng.uniform(0.85, 1.15)
@@ -106,7 +126,11 @@ def augment_sequence(sequence, rng, include_camera_shift=True):
 
 
 def mirror_sequence(sequence):
-    """Mirrors two-handed samples; one-handed samples are already canonical."""
+    """Refleja muestras bimanuales; las de una mano ya son canonicas."""
+    # BLOQUE: variante de lateralidad.
+    # Se intercambian ambas manos y se invierte su eje horizontal. Esto expone al
+    # modelo a una ejecucion en espejo sin duplicar videos, pero no modifica las
+    # senas de una mano porque el pipeline ya las llevo a una forma canonica.
     sequence = np.asarray(sequence, dtype=np.float32)
     hands = sequence.reshape(sequence.shape[0], 2, 21, 3).copy()
     visible = np.any(np.abs(hands) > 1e-6, axis=(2, 3))
@@ -126,6 +150,10 @@ def expand_with_augmentation(
     include_mirror=True,
 ):
     """Adds realistic timing/noise variants and optional opposite-hand variants."""
+    # BLOQUE: expansion reproducible del conjunto de entrenamiento.
+    # La semilla fija hace reproducible la expansion de un mismo dataset. Cada
+    # muestra conserva su etiqueta y recibe variantes que respetan si la clase
+    # puede o no trasladarse respecto a la camara.
     rng = np.random.default_rng(42)
     expanded_X = []
     expanded_y = []
@@ -147,6 +175,10 @@ def expand_with_augmentation(
 
 
 def flatten_video_windows(video_indexes, windows_by_video, video_labels, primary_only=False):
+    # BLOQUE: conversion a tensores de entrenamiento.
+    # Convierte ventanas de videos seleccionados en X/y sin perder su etiqueta.
+    # Se usa despues del split por video para evitar que una ventana casi igual
+    # de la misma grabacion aparezca en entrenamiento y validacion.
     X, y = [], []
     for video_index in video_indexes:
         windows = windows_by_video[video_index][:1] if primary_only else windows_by_video[video_index]
@@ -156,6 +188,10 @@ def flatten_video_windows(video_indexes, windows_by_video, video_labels, primary
 
 
 def print_validation_report(model, X_val, y_val, labels, title):
+    # BLOQUE: diagnostico de validacion.
+    # Informa calidad por clase y no solo accuracy global. Tambien enumera hacia
+    # que otra etiqueta se desviaron los errores, dato necesario para decidir que
+    # senas requieren mas ejemplos o una grabacion con diferencias mas claras.
     probabilities = model.predict(X_val, verbose=0)
     predicted = np.argmax(probabilities, axis=1)
     confidence = np.max(probabilities, axis=1)
@@ -175,6 +211,10 @@ def print_validation_report(model, X_val, y_val, labels, title):
 
 
 def main():
+    # BLOQUE: parametros reproducibles de entrenamiento.
+    # Define dataset, tamano temporal, aumentos y reglas que usara la inferencia.
+    # Los umbrales no cambian los pesos, pero se guardan con el paquete para que
+    # web, mobile y escritorio apliquen criterios de aceptacion coherentes.
     parser = argparse.ArgumentParser(
         description="Entrena un modelo de Lengua de Señas Colombiana usando videos organizados por carpeta."
     )
@@ -229,6 +269,9 @@ def main():
     args.stable_predictions = max(1, args.stable_predictions)
     include_motion_features = not args.no_motion_features
 
+    # BLOQUE: validacion previa del dataset.
+    # Confirma que hay clases y videos suficientes antes de consumir recursos.
+    # Tambien crea el mapeo estable etiqueta -> indice usado por Softmax.
     samples = collect_videos(args.data)
     if not samples:
         raise SystemExit("No encontré videos. Usa una estructura como videos/hola/video1.mp4")
@@ -250,6 +293,10 @@ def main():
         label_to_index[label] for label in POSITION_SENSITIVE_LABELS if label in label_to_index
     }
 
+    # BLOQUE: video a secuencias de landmarks.
+    # Extrae landmarks una sola vez por video y conserva sus ventanas por
+    # separado. Si MediaPipe no ve manos en una grabacion, se excluye porque no
+    # contiene evidencia util para la etiqueta declarada.
     extractor = LandmarkExtractor()
     windows_by_video, video_labels = [], []
     try:
@@ -290,7 +337,8 @@ def main():
             "una traduccion cuando no hay sena."
         )
 
-    # Split videos before creating windows or augmentations. This prevents windows from
+    # BLOQUE: separacion entrenamiento/validacion.
+    # La division ocurre por video antes de crear ventanas o aumentos. Evita que ventanas del
     # the same recording leaking into validation.
     can_validate = len(labels) > 1 and len(video_labels) >= len(labels) * 3 and np.all(raw_counts >= 3)
     video_indexes = np.arange(len(video_labels))
@@ -338,7 +386,9 @@ def main():
         monitor_mode = "min"
         print(f"Dataset final: {len(X_train)} secuencias ({args.augmentations} aumentos por video).")
 
-    # Apply the same fixed-length smoothing and optional motion features used by the live recognizer.
+    # BLOQUE: preparacion final de tensores.
+    # Aplica el mismo preprocesamiento de longitud fija y movimiento que usara el
+    # reconocedor en vivo; esta equivalencia evita diferencias entrenamiento-produccion.
     X_train = prepare_model_sequences(
         X_train,
         args.sequence_length,
@@ -353,10 +403,17 @@ def main():
         )
         validation_data = (X_val, y_val)
 
+    # BLOQUE: balance entre clases.
+    # Compensa etiquetas con menos muestras para que no queden eclipsadas por
+    # la clase que tenga mas videos o ventanas.
     class_weights = compute_class_weight(class_weight="balanced", classes=np.unique(y_train), y=y_train)
     class_weight = {int(label): float(weight) for label, weight in zip(np.unique(y_train), class_weights)}
 
     MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+    # BLOQUE: optimizacion de pesos.
+    # Construye la red y configura callbacks. EarlyStopping recupera el mejor
+    # punto antes de que el modelo se sobreajuste; ReduceLROnPlateau disminuye el
+    # paso de aprendizaje cuando deja de mejorar; ModelCheckpoint persiste pesos.
     model = build_model(args.sequence_length, X_train.shape[2], len(labels))
     callbacks = [
         tf.keras.callbacks.EarlyStopping(patience=15, restore_best_weights=True, monitor=monitor, mode=monitor_mode),
@@ -374,6 +431,9 @@ def main():
         "class_weight": class_weight,
         "callbacks": callbacks,
     }
+    # BLOQUE: validacion posterior al entrenamiento.
+    # La validacion por clase y la validacion espejo miden generalizacion antes
+    # de reemplazar el paquete publicado del modelo.
     if validation_data:
         fit_kwargs["validation_data"] = validation_data
 
@@ -394,6 +454,10 @@ def main():
             mirrored_metrics = model.evaluate(X_val_mirrored, y_val, verbose=0, return_dict=True)
             print(f"Validacion espejo: accuracy={mirrored_metrics['accuracy']:.1%}, loss={mirrored_metrics['loss']:.4f}")
 
+    # BLOQUE: publicacion local del paquete entrenado.
+    # Guarda pesos, etiquetas y configuracion como una unidad compatible. El
+    # servicio valida estos archivos al arrancar para impedir inferencias con
+    # orden de etiquetas o numero de caracteristicas equivocados.
     model.save(MODEL_PATH)
     save_metadata(
         labels,
@@ -412,4 +476,5 @@ def main():
 
 
 if __name__ == "__main__":
+    # El entrenamiento solo comienza al ejecutar este archivo directamente.
     main()
