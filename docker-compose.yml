@@ -1,0 +1,28 @@
+services:
+  ai-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: onelanguage-ai:local
+    container_name: onelanguage-ai
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      AI_HOST: 0.0.0.0
+      AI_PORT: 8000
+      AI_RELOAD: "false"
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173}
+    ports:
+      - "${AI_HOST_PORT:-8000}:8000"
+    volumes:
+      # The model is intentionally local/ignored by Git. Mount a compatible
+      # package here so the image stays small and deployments can update it.
+      - ./model:/app/model:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      start_period: 45s
+      retries: 3
