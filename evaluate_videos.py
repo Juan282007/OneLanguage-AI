@@ -22,12 +22,23 @@ from lsc_pipeline import (
 from train_from_videos import collect_videos
 
 
+# BLOQUE: auditoria de clasificacion por video.
+# Carga el paquete entrenado y contabiliza aciertos y confusiones. A diferencia
+# de la prueba live, aqui se analiza el resultado del clasificador por video;
+# debe ejecutarse con grabaciones no usadas para entrenar para evitar metricas
+# artificialmente altas.
 def main():
+    # BLOQUE: parametros de auditoria.
+    # Define el dataset y permite limitar el analisis a etiquetas especificas
+    # cuando se investiga una confusion concreta.
     parser = argparse.ArgumentParser(description="Evalua el modelo LSC por video y muestra confusiones.")
     parser.add_argument("--data", default="videos", help="Carpeta videos/<etiqueta>/*")
     parser.add_argument("--labels", help="Etiquetas separadas por coma para limitar la auditoria.")
     args = parser.parse_args()
 
+    # BLOQUE: preparacion de recursos.
+    # Carga el contrato del modelo para reproducir exactamente su entrada, filtra
+    # los videos solicitados e inicializa acumuladores por etiqueta real.
     labels = json.loads(LABELS_PATH.read_text(encoding="utf-8"))
     config = load_model_config()
     sequence_length = int(config["sequence_length"])
@@ -38,12 +49,17 @@ def main():
     if not samples:
         raise SystemExit("No encontre videos para las etiquetas solicitadas.")
 
+    # Acumuladores por etiqueta para construir el reporte de rendimiento.
     extractor = LandmarkExtractor(include_motion_features=include_motion)
     totals = defaultdict(int)
     correct = defaultdict(int)
     confusions = defaultdict(lambda: defaultdict(int))
     try:
         for video_path, expected_label in samples:
+            # BLOQUE: inferencia de un clip.
+            # Convierte un clip en una o varias ventanas comparables con las del
+            # entrenamiento. Los videos sin landmarks se informan por separado,
+            # porque no es correcto contarlos como una confusion de la red.
             windows = extract_video_sequences(
                 video_path,
                 extractor,
@@ -55,6 +71,8 @@ def main():
                 print(f"SIN MANOS  {video_path}")
                 continue
 
+            # Promedia la evidencia de ventanas y registra la prediccion dominante
+            # para detectar las clases que se confunden y su nivel de confianza.
             prepared = prepare_model_sequences(windows, sequence_length, include_motion_features=include_motion)
             probabilities = model.predict(prepared, verbose=0).mean(axis=0)
             predicted_label = labels[int(np.argmax(probabilities))]
@@ -67,6 +85,7 @@ def main():
     finally:
         extractor.close()
 
+    # Resume exactitud y errores por clase, no solo una exactitud global.
     print("\nResumen por sena:")
     for label in sorted(totals):
         errors = [f"{predicted}={count}" for predicted, count in confusions[label].items() if predicted != label]
@@ -75,4 +94,5 @@ def main():
 
 
 if __name__ == "__main__":
+    # Evita ejecutar la auditoria cuando el modulo se importa desde otro script.
     main()

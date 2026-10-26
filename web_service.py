@@ -18,6 +18,10 @@ from fastapi.middleware.cors import CORSMiddleware
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
+# BLOQUE: ubicacion estable del servicio.
+# Fuerza rutas relativas estables aunque Uvicorn o Docker inicien desde otra
+# carpeta. Asi `model/`, `.env` y los archivos de configuracion se resuelven
+# siempre respecto a este repositorio y no al directorio del proceso padre.
 os.chdir(PROJECT_DIR)
 
 try:
@@ -46,6 +50,10 @@ from lsc_pipeline import (
 )
 
 
+# BLOQUE: limites y politicas de sesion.
+# El servicio recibe JPEGs por red. MAX_FRAME_BYTES evita que un cliente envie
+# archivos enormes y agote la memoria. Los demas valores equilibran respuesta
+# rapida con evidencia suficiente para no confirmar una sena por un solo frame.
 MAX_FRAME_BYTES = 2_500_000
 # Keep a partial sequence while a palm turn momentarily loses hand tracking.
 MISSING_HAND_RESET_FRAMES = 12
@@ -59,15 +67,22 @@ logger = logging.getLogger(__name__)
 
 
 def _allowed_origins():
+    # BLOQUE: seguridad de origenes.
+    # Lee los origenes permitidos desde el entorno y elimina espacios o valores
+    # vacios. Un navegador distinto de los registrados no puede abrir el canal
+    # WebSocket, incluso si conoce la IP y el puerto del servicio.
     configured = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173")
     return [origin.strip() for origin in configured.split(",") if origin.strip()]
 
 
 def _display_label(label):
+    # Convierte el identificador interno de dataset en texto presentado al usuario.
     return format_label(label)
 
 
 def _prediction_margin(probabilities):
+    # Mide cuanta separacion hay entre la primera y segunda opcion. Una confianza
+    # alta sin margen puede seguir siendo ambigua si dos senas compiten muy cerca.
     if len(probabilities) < 2:
         return 1.0
     top_two = np.partition(probabilities, -2)[-2:]
@@ -78,6 +93,10 @@ class ModelRuntime:
     """Loads one compatible model package and shares it across web sessions."""
 
     def __init__(self):
+        # BLOQUE: carga unica del paquete de IA.
+        # Carga una unica copia de pesos, etiquetas y configuracion compartida
+        # por todas las conexiones. Esto evita recargar TensorFlow por usuario,
+        # reduce memoria y garantiza que todos los clientes usan la misma version.
         if not MODEL_PATH.exists() or not LABELS_PATH.exists():
             raise RuntimeError("No encontre el modelo. Coloca el paquete compatible dentro de model/.")
 
@@ -104,6 +123,9 @@ class ModelRuntime:
         )
         expected_features = FEATURE_SIZE + (MOTION_FEATURE_SIZE if self.include_motion_features else 0)
 
+        # BLOQUE: comprobacion de integridad del paquete.
+        # Verifica que los tres artefactos del paquete sean compatibles antes
+        # de aceptar trafico de la aplicacion.
         if int(self.model.input_shape[1]) != self.sequence_length:
             raise RuntimeError("El modelo y lsc_config.json usan longitudes de secuencia diferentes.")
         if int(self.model.input_shape[2]) != expected_features:
@@ -114,10 +136,18 @@ class ModelRuntime:
         self._predict_lock = threading.Lock()
 
     def predict(self, sequence):
+        # BLOQUE: inferencia concurrente controlada.
+        # TensorFlow se protege con un candado porque varias sesiones pueden
+        # solicitar inferencia desde hilos distintos al mismo tiempo. El bloqueo
+        # evita condiciones de carrera al reutilizar la misma instancia cargada.
         with self._predict_lock:
             return self.model.predict(sequence[None, ...], verbose=0)[0]
 
     def metadata(self):
+        # BLOQUE: metadatos del modelo.
+        # Publica solo informacion segura que web/mobile necesita para adaptar la
+        # interfaz: etiquetas disponibles y parametros temporales. No expone pesos
+        # ni rutas internas del servidor.
         return {
             "model_version": self.config.get("model_version", "local"),
             "preprocessing_version": self.config.get("preprocessing_version"),
@@ -132,6 +162,10 @@ class RecognitionSession:
     """Keeps temporal landmarks isolated for one browser WebSocket connection."""
 
     def __init__(self, runtime):
+        # BLOQUE: estado aislado por cliente.
+        # Cada WebSocket recibe extractor y buffers propios para que los frames
+        # de distintos usuarios nunca se mezclen. Solo `ModelRuntime` se comparte
+        # porque contiene pesos inmutables y costosos de cargar.
         self.runtime = runtime
         self.extractor = Preprocessor(
             include_wrist_trajectory=bool(runtime.config.get("uses_wrist_trajectory", False)),
@@ -148,6 +182,10 @@ class RecognitionSession:
         self.extractor.close()
 
     def _reset(self):
+        # BLOQUE: reinicio de un gesto.
+        # Borra la ventana, predicciones y traduccion confirmada despues de perder
+        # manos durante suficiente tiempo. Esto evita que la siguiente sena use
+        # frames residuales del gesto anterior.
         self.sequence.clear()
         self.predictions.clear()
         self.visible_hand_frames = 0
@@ -155,6 +193,10 @@ class RecognitionSession:
         self.committed_confidence = 0.0
 
     def _response(self, status, confidence=0.0, label=None, is_new_translation=False):
+        # BLOQUE: respuesta uniforme para clientes.
+        # Centraliza el contrato JSON para que web y mobile interpreten los mismos
+        # estados, confianza y texto. `is_new_translation` permite guardar una
+        # sola vez una sena estable aunque lleguen muchos frames posteriores.
         return {
             "type": "prediction",
             "status": status,
@@ -166,6 +208,9 @@ class RecognitionSession:
         }
 
     def process_encoded_frame(self, payload):
+        # BLOQUE: validacion de datos recibidos.
+        # Rechaza paquetes vacios o demasiado grandes antes de decodificarlos y
+        # transforma bytes JPEG en una imagen OpenCV apta para MediaPipe.
         if not payload or len(payload) > MAX_FRAME_BYTES:
             raise ValueError("El frame recibido no tiene un tamano valido.")
 
@@ -178,6 +223,11 @@ class RecognitionSession:
         return self.process_features(self.extractor.frame_features(frame))
 
     def process_features(self, features):
+        # BLOQUE: maquina de estados del reconocimiento en vivo.
+        # Primero comprueba si hay manos; luego acumula evidencia temporal,
+        # prepara la ventana, calcula probabilidades y filtra por confianza,
+        # margen y estabilidad. La respuesta distingue entre seguir analizando,
+        # esperar una sena mas clara, reiniciar o confirmar una traduccion.
         if not np.any(np.abs(features) > 1e-5):
             self.missing_hand_frames += 1
             if self.missing_hand_frames >= MISSING_HAND_RESET_FRAMES:
@@ -234,6 +284,10 @@ class RecognitionSession:
         return self._response("translated", confidence, raw_label, is_new_translation)
 
 
+# BLOQUE: creacion de la aplicacion HTTP/WebSocket.
+# La inicializacion falla temprano si el paquete del modelo no esta disponible o
+# es incompatible. CORS se limita a origenes configurados para que solo las
+# aplicaciones autorizadas puedan iniciar una sesion de reconocimiento.
 runtime = ModelRuntime()
 allowed_origins = _allowed_origins()
 app = FastAPI(title="OneLanguage LSC Service", version="1.0.0")
@@ -248,22 +302,34 @@ app.add_middleware(
 
 @app.get("/health")
 def health():
+    # BLOQUE: sonda de disponibilidad.
+    # Docker, monitoreo y soporte usan este endpoint para saber que FastAPI y el
+    # modelo cargado siguen disponibles sin abrir una camara ni un WebSocket.
     return {"status": "ok", **runtime.metadata()}
 
 
 @app.get("/model-info")
 def model_info():
+    # BLOQUE: consulta de capacidades.
+    # Permite que el frontend conozca las etiquetas y parametros no sensibles sin
+    # tener que mantener una lista duplicada o desactualizada en su propio codigo.
     return runtime.metadata()
 
 
 @app.websocket("/ws/recognize")
 async def recognize(websocket: WebSocket):
+    # BLOQUE: canal de reconocimiento bidireccional.
+    # Recibe JPEGs y responde un JSON por cada frame. Se rechaza el origen antes
+    # de aceptar la conexion; el procesamiento pesado se envia a un hilo para no
+    # bloquear el bucle asincrono de FastAPI mientras MediaPipe y TensorFlow corren.
     origin = websocket.headers.get("origin")
     if origin and "*" not in allowed_origins and origin not in allowed_origins:
         logger.warning("WebSocket rejected for origin: %s", origin)
         await websocket.close(code=1008)
         return
 
+    # La sesion se crea despues de validar el origen y se cierra siempre, incluso
+    # cuando el navegador desconecta o envia un frame invalido.
     await websocket.accept()
     session = RecognitionSession(runtime)
     await websocket.send_json({"type": "ready", **runtime.metadata()})
@@ -283,6 +349,7 @@ async def recognize(websocket: WebSocket):
 
 
 if __name__ == "__main__":
+    # Ejecucion directa para desarrollo; en Docker se usa el mismo modulo.
     import uvicorn
 
     uvicorn.run(

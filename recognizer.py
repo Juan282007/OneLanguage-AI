@@ -30,6 +30,11 @@ from lsc_pipeline import (
 )
 
 
+# BLOQUE: contrato del reconocedor.
+# Separa tres responsabilidades que no deben confundirse: convertir frames en
+# datos del modelo, calcular probabilidades y decidir si una probabilidad ya es
+# una traduccion confiable. Esto permite mantener la misma logica al cambiar la
+# fuente entre camara, video guardado o una futura interfaz.
 class BaseSignRecognizer(ABC):
     """Stable contract for recognizers that consume temporal landmark sequences."""
 
@@ -50,6 +55,11 @@ class Speaker:
     """Runs pyttsx3 in one dedicated thread, which is required by Windows voices."""
 
     def __init__(self):
+        # BLOQUE: recursos del motor de voz.
+        # El motor de voz se ejecuta fuera del hilo de camara para evitar que una
+        # pronunciacion bloquee la lectura de nuevos fotogramas. Una cola de un
+        # solo elemento da prioridad a la traduccion mas reciente, no a una lista
+        # larga de mensajes que ya perderian sentido al escucharse tarde.
         self.enabled = False
         self.available = False
         self.error = None
@@ -73,6 +83,10 @@ class Speaker:
         return None
 
     def _run(self):
+        # BLOQUE: ciclo de voz asincrono.
+        # Inicializa pyttsx3, intenta elegir una voz en espanol y despues consume
+        # mensajes hasta recibir None como senal de cierre. Los errores se guardan
+        # para informar a la interfaz sin detener el reconocimiento visual.
         engine = None
         try:
             import pyttsx3
@@ -103,6 +117,9 @@ class Speaker:
                 self.available = False
 
     def say(self, text):
+        # BLOQUE: encolado de una traduccion.
+        # Mantiene solo el mensaje mas reciente para no acumular pronunciaciones
+        # atrasadas cuando el usuario hace varias senas rapidamente.
         if not self.enabled or not self.available or not text:
             return False
 
@@ -136,6 +153,10 @@ class Speaker:
 
 
 class SignRecognizer(BaseSignRecognizer):
+    # BLOQUE: politicas temporales de escritorio.
+    # La perdida corta de una mano no reinicia de inmediato el gesto porque una
+    # rotacion puede ocultar la palma. Algunas senas exigen mas frames visibles o
+    # una estabilidad particular antes de considerarse terminadas.
     # Palm rotations can briefly make MediaPipe lose a hand. Keep the current
     # movement buffer long enough to classify a continuous rotational sign.
     MISSING_HAND_RESET_FRAMES = 12
@@ -154,6 +175,10 @@ class SignRecognizer(BaseSignRecognizer):
         minimum_margin=None,
         stable_predictions=None,
     ):
+        # BLOQUE: estado de una sesion local.
+        # Guarda fuente de video, tamano de ventana, voz y buffers. El buffer
+        # puede almacenar hasta tres secuencias para seleccionar el gesto visible
+        # completo sin crecer indefinidamente en memoria.
         self.source = int(source) if str(source).isdigit() else source
         self.is_camera = isinstance(self.source, int)
         self.window_name = "Traductor LSC"
@@ -168,6 +193,9 @@ class SignRecognizer(BaseSignRecognizer):
         self.missing_hand_frames = 0
         self.visible_hand_frames = 0
 
+        # BLOQUE: carga y compatibilidad del modelo.
+        # Carga el paquete temporal actual. El modo legacy solo mantiene
+        # compatibilidad con artefactos anteriores del proyecto.
         if MODEL_PATH.exists() and LABELS_PATH.exists():
             self.mode = "sequence"
             self.model = tf.keras.models.load_model(MODEL_PATH)
@@ -195,6 +223,9 @@ class SignRecognizer(BaseSignRecognizer):
             with open("model/feature_order.json", encoding="utf-8") as file:
                 self.feature_order = json.load(file)
 
+        # BLOQUE: configuracion de umbrales.
+        # Las reglas de aceptacion pueden venir del paquete entrenado o de
+        # argumentos de consola para experimentar sin modificar los pesos.
         configured_threshold = self.model_config.get("confidence_threshold") if self.mode == "sequence" else None
         configured_margin = self.model_config.get("minimum_margin") if self.mode == "sequence" else None
         configured_stability = self.model_config.get("stable_predictions") if self.mode == "sequence" else None
@@ -221,6 +252,9 @@ class SignRecognizer(BaseSignRecognizer):
         )
         self.predictions = deque(maxlen=self.stable_predictions)
 
+        # BLOQUE: apertura segura de la camara o video.
+        # Abre y configura la fuente al final, cuando todo el contrato del
+        # modelo ya fue validado y puede liberar recursos ante un error.
         self.cap = open_video_capture(self.source)
         if self.is_camera:
             self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.window_width)
@@ -245,6 +279,11 @@ class SignRecognizer(BaseSignRecognizer):
         return load_model_config()
 
     def _validate_model_contract(self):
+        # BLOQUE: validacion de artefactos.
+        # Impide usar pesos, etiquetas o preprocesamiento de versiones distintas.
+        # Sin esta comprobacion un modelo podria producir una clase correcta en
+        # apariencia, pero asociada a una etiqueta equivocada o a features mal
+        # calculadas.
         input_shape = self.model.input_shape
         expected_sequence_length = int(input_shape[1])
         expected_feature_size = int(input_shape[2])
@@ -300,11 +339,18 @@ class SignRecognizer(BaseSignRecognizer):
         self.visible_hand_frames = 0
 
     def preprocess(self, frames: Sequence[np.ndarray]) -> np.ndarray:
+        # BLOQUE: preprocesamiento previo a inferencia.
+        # Convierte landmarks crudos a la forma exacta esperada por el modelo:
+        # longitud fija, suavizado y movimiento cuando corresponde.
         if self.mode == "legacy":
             return np.asarray(frames, dtype=np.float32)
         return self.extractor.prepare_sequence(frames, self.sequence_length)
 
     def predict(self, sequence: np.ndarray) -> Dict[str, float]:
+        # BLOQUE: inferencia de una secuencia.
+        # Ejecuta el modelo vigente y asocia cada posicion de su salida Softmax
+        # con la etiqueta almacenada en el paquete. La forma se valida antes de
+        # llamar TensorFlow para detectar errores de contrato temprano.
         if self.mode == "legacy":
             frame = np.asarray(sequence)
             features = self.get_legacy_landmarks(frame)
@@ -336,6 +382,9 @@ class SignRecognizer(BaseSignRecognizer):
         return label, confidence, is_new_translation, True
 
     def postprocess(self, prediction: Dict[str, float]):
+        # BLOQUE: decision de traduccion.
+        # Filtra resultados ambiguos y exige estabilidad para reducir falsos
+        # positivos antes de confirmar una traduccion visible.
         raw_label = max(prediction, key=prediction.get)
         confidence = prediction[raw_label]
         margin = self._prediction_margin(np.fromiter(prediction.values(), dtype=np.float32))
@@ -371,6 +420,9 @@ class SignRecognizer(BaseSignRecognizer):
         return label, stable_confidence, is_new_translation, True
 
     def classify_frame(self, frame):
+        # BLOQUE: procesamiento de un frame.
+        # Orquesta un ciclo de camara: landmarks -> buffer -> ventana activa ->
+        # prediccion -> politicas de aceptacion.
         if self.mode == "legacy":
             return self._classify_legacy(frame)
 
@@ -393,6 +445,7 @@ class SignRecognizer(BaseSignRecognizer):
         return self.postprocess(self.predict(sequence))
 
     def _configure_window(self):
+        # Configura la ventana de OpenCV independiente del origen de video.
         cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(self.window_name, self.window_width, self.window_height)
         self._set_fullscreen(self.fullscreen)
@@ -403,6 +456,7 @@ class SignRecognizer(BaseSignRecognizer):
         cv2.setWindowProperty(self.window_name, cv2.WND_PROP_FULLSCREEN, mode)
 
     def _draw_overlay(self, frame, label, confidence, is_stable):
+        # Dibuja estado de reconocimiento y accesos de teclado sobre el frame.
         if confidence:
             text = f"{label} ({confidence:.0%})"
         else:
@@ -422,6 +476,9 @@ class SignRecognizer(BaseSignRecognizer):
         cv2.putText(frame, "ESC salir | ESPACIO hablar | V voz | A auto | F pantalla completa", (30, 115), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
 
     def run(self):
+        # BLOQUE: ciclo de la aplicacion de escritorio.
+        # Bucle principal de escritorio y liberacion garantizada de camara,
+        # MediaPipe, voz y ventanas aun cuando ocurre un error.
         self._configure_window()
         try:
             while True:
@@ -458,6 +515,7 @@ class SignRecognizer(BaseSignRecognizer):
 
 
 def parse_args():
+    # Define opciones de consola sin mezclar configuracion de UI con la red.
     parser = argparse.ArgumentParser(description="Reconoce Lengua de Senas Colombiana desde camara o video.")
     parser.add_argument("--source", default="0", help="0 para camara o ruta a un video")
     parser.add_argument("--no-speak", action="store_true", help="Desactiva la voz")
@@ -487,6 +545,7 @@ def parse_args():
 
 
 if __name__ == "__main__":
+    # Permite ejecutar recognizer.py directamente para pruebas locales.
     args = parse_args()
     app = SignRecognizer(
         source=args.source,
