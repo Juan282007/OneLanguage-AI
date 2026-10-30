@@ -217,7 +217,7 @@ El archivo `.gitignore` excluye el entorno virtual, los videos, los modelos gene
 La imagen Docker ejecuta el servicio FastAPI/WebSocket de reconocimiento en CPU. Los videos de entrenamiento y los pesos no se copian a la imagen: el paquete compatible de `model/` se monta como volumen de solo lectura al iniciar el contenedor.
 
 1. Asegura que `model/` contenga `lsc_sequence_model.keras`, `lsc_labels.json` y `lsc_config.json` compatibles.
-2. Copia `.env.example` a `.env` y configura los origenes que usaran web o movil en `ALLOWED_ORIGINS`.
+2. Copia `.env.example` a `.env`, configura los origenes exactos de web o movil en `ALLOWED_ORIGINS` y asigna a `JWT_SECRET` el mismo secreto vigente que firma los tokens en el backend. No publiques ese valor ni lo guardes en Git.
 3. Construye e inicia el servicio:
 
    ```powershell
@@ -233,6 +233,12 @@ La imagen Docker ejecuta el servicio FastAPI/WebSocket de reconocimiento en CPU.
 El WebSocket queda disponible en `ws://<IP-DEL-EQUIPO>:<AI_HOST_PORT>/ws/recognize`. El puerto predeterminado es 8000; si `.env` define `AI_HOST_PORT=8001`, comprueba `http://localhost:8001/health` y usa el puerto 8001 en web y movil. Para detenerlo usa `docker compose down`; para ver los registros usa `docker compose logs -f ai-service`.
 
 El servicio usa por defecto 4 fotogramas visibles antes de inferir y 2 predicciones consecutivas para confirmar. Puedes ajustar `AI_LIVE_MINIMUM_FRAMES` y `AI_LIVE_STABLE_PREDICTIONS` en `.env` y reiniciar Docker; reduce los valores solo despues de medir los falsos positivos con `evaluate_live.py`.
+
+## Autenticacion y limites del WebSocket
+
+El endpoint `/ws/recognize` exige una cabecera `Origin` incluida exactamente en `ALLOWED_ORIGINS` y valida el JWT emitido por el backend antes de crear una sesion de reconocimiento. Web y movil deben enviar `{"type":"auth","token":"<JWT>"}` al abrir el socket; la IA responde `ready` solo despues de verificar firma, sujeto y expiracion. El servicio limita cada IP a 3 conexiones simultaneas y 25 fotogramas por segundo.
+
+En produccion, mantén el puerto de IA ligado a `127.0.0.1` y delante de Nginx. Configura Nginx para reemplazar `X-Real-IP` con `$remote_addr` y activa `AI_TRUST_PROXY_HEADERS=true` en el contenedor; asi las cuotas se aplican por visitante real y no por la IP compartida del proxy. En desarrollo directo deja esta opcion en `false`.
 
 Para actualizar un modelo entrenado, reemplaza los archivos dentro de `model/` por un paquete compatible y reinicia el servicio con `docker compose restart ai-service`. No es necesario reconstruir la imagen.
 

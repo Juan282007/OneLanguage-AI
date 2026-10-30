@@ -11,6 +11,7 @@ from collections import deque
 from pathlib import Path
 
 import cv2
+import jwt
 import numpy as np
 import tensorflow as tf
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -55,6 +56,9 @@ from lsc_pipeline import (
 # archivos enormes y agote la memoria. Los demas valores equilibran respuesta
 # rapida con evidencia suficiente para no confirmar una sena por un solo frame.
 MAX_FRAME_BYTES = 2_500_000
+MAX_CONNECTIONS_PER_IP = 3
+MAX_FRAMES_PER_SECOND = 25
+AUTHENTICATION_TIMEOUT_SECONDS = 5
 # Keep a partial sequence while a palm turn momentarily loses hand tracking.
 MISSING_HAND_RESET_FRAMES = 12
 # Live clients submit one frame at a time. Keep the confirmation short enough
@@ -64,6 +68,8 @@ DEFAULT_LIVE_STABLE_PREDICTIONS = 2
 MINIMUM_VISIBLE_FRAMES_BY_LABEL = {"como-estas": 14}
 STABLE_PREDICTIONS_BY_LABEL = {"el": 2}
 logger = logging.getLogger(__name__)
+active_connections_by_ip = {}
+active_connections_lock = asyncio.Lock()
 
 
 def _allowed_origins():
@@ -76,6 +82,49 @@ def _allowed_origins():
         "http://localhost:5173,http://127.0.0.1:5173,https://localhost:5173,https://127.0.0.1:5173",
     )
     return [origin.strip() for origin in configured.split(",") if origin.strip()]
+
+
+def _valid_access_token(token):
+    secret = os.getenv("JWT_SECRET", "").strip()
+    if not secret or not isinstance(token, str) or not token:
+        return False
+    try:
+        claims = jwt.decode(
+            token,
+            secret,
+            algorithms=["HS256", "HS384", "HS512"],
+            options={"require": ["exp", "sub"]},
+        )
+    except jwt.PyJWTError:
+        return False
+    return isinstance(claims.get("sub"), str) and bool(claims["sub"].strip())
+
+
+async def _reserve_connection(client_ip):
+    async with active_connections_lock:
+        current = active_connections_by_ip.get(client_ip, 0)
+        if current >= MAX_CONNECTIONS_PER_IP:
+            return False
+        active_connections_by_ip[client_ip] = current + 1
+        return True
+
+
+async def _release_connection(client_ip):
+    async with active_connections_lock:
+        current = active_connections_by_ip.get(client_ip, 0)
+        if current <= 1:
+            active_connections_by_ip.pop(client_ip, None)
+        else:
+            active_connections_by_ip[client_ip] = current - 1
+
+
+def _client_ip(websocket):
+    peer_ip = websocket.client.host if websocket.client else "unknown"
+    if os.getenv("AI_TRUST_PROXY_HEADERS", "false").casefold() == "true":
+        proxy_ip = websocket.headers.get("x-real-ip", "").strip()
+        if proxy_ip:
+            return proxy_ip
+    return peer_ip
 
 
 def _display_label(label):
@@ -326,19 +375,53 @@ async def recognize(websocket: WebSocket):
     # de aceptar la conexion; el procesamiento pesado se envia a un hilo para no
     # bloquear el bucle asincrono de FastAPI mientras MediaPipe y TensorFlow corren.
     origin = websocket.headers.get("origin")
-    if origin and "*" not in allowed_origins and origin not in allowed_origins:
+    if not origin or origin not in allowed_origins:
         logger.warning("WebSocket rejected for origin: %s", origin)
         await websocket.close(code=1008)
         return
 
-    # La sesion se crea despues de validar el origen y se cierra siempre, incluso
-    # cuando el navegador desconecta o envia un frame invalido.
-    await websocket.accept()
-    session = RecognitionSession(runtime)
-    await websocket.send_json({"type": "ready", **runtime.metadata()})
+    client_ip = _client_ip(websocket)
+    if not await _reserve_connection(client_ip):
+        logger.warning("WebSocket connection limit reached for client: %s", client_ip)
+        await websocket.close(code=1008)
+        return
+
+    session = None
     try:
+        await websocket.accept()
+        try:
+            auth_message = await asyncio.wait_for(
+                websocket.receive_json(), timeout=AUTHENTICATION_TIMEOUT_SECONDS
+            )
+        except asyncio.TimeoutError:
+            logger.warning("WebSocket authentication timed out for client: %s", client_ip)
+            await websocket.close(code=1008)
+            return
+        except (WebSocketDisconnect, ValueError):
+            return
+
+        if (
+            not isinstance(auth_message, dict)
+            or auth_message.get("type") != "auth"
+            or not _valid_access_token(auth_message.get("token"))
+        ):
+            logger.warning("WebSocket rejected invalid authentication for client: %s", client_ip)
+            await websocket.close(code=1008)
+            return
+
+        session = RecognitionSession(runtime)
+        await websocket.send_json({"type": "ready", **runtime.metadata()})
+        frame_timestamps = deque()
         while True:
             payload = await websocket.receive_bytes()
+            now = asyncio.get_running_loop().time()
+            while frame_timestamps and now - frame_timestamps[0] >= 1:
+                frame_timestamps.popleft()
+            if len(frame_timestamps) >= MAX_FRAMES_PER_SECOND:
+                logger.warning("WebSocket frame rate exceeded for client: %s", client_ip)
+                await websocket.close(code=1008)
+                return
+            frame_timestamps.append(now)
             try:
                 prediction = await asyncio.to_thread(session.process_encoded_frame, payload)
             except ValueError as error:
@@ -348,7 +431,9 @@ async def recognize(websocket: WebSocket):
     except WebSocketDisconnect:
         pass
     finally:
-        session.close()
+        if session is not None:
+            session.close()
+        await _release_connection(client_ip)
 
 
 if __name__ == "__main__":

@@ -13,7 +13,9 @@ services:
       AI_HOST: 0.0.0.0
       AI_PORT: 8000
       AI_RELOAD: "false"
+      AI_TRUST_PROXY_HEADERS: ${AI_TRUST_PROXY_HEADERS:-false}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173,https://localhost:5173,https://127.0.0.1:5173}
+      JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET to the same signing secret used by the backend}
     ports:
       - "${AI_HOST_PORT:-8000}:8000"
     volumes:
