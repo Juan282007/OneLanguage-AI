@@ -71,7 +71,10 @@ def _allowed_origins():
     # Lee los origenes permitidos desde el entorno y elimina espacios o valores
     # vacios. Un navegador distinto de los registrados no puede abrir el canal
     # WebSocket, incluso si conoce la IP y el puerto del servicio.
-    configured = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173")
+    configured = os.getenv(
+        "ALLOWED_ORIGINS",
+        "http://localhost:5173,http://127.0.0.1:5173,https://localhost:5173,https://127.0.0.1:5173",
+    )
     return [origin.strip() for origin in configured.split(",") if origin.strip()]
 
 

@@ -5,6 +5,17 @@ from starlette.websockets import WebSocketDisconnect
 import web_service
 
 
+def test_default_allowed_origins_include_http_and_https(monkeypatch):
+    monkeypatch.delenv("ALLOWED_ORIGINS", raising=False)
+
+    assert web_service._allowed_origins() == [
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "https://localhost:5173",
+        "https://127.0.0.1:5173",
+    ]
+
+
 def test_health_reports_loaded_model():
     response = TestClient(web_service.app).get("/health")
     assert response.status_code == 200
