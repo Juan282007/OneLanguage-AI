@@ -138,9 +138,9 @@ python web_service.py
 
 El servicio queda disponible en `http://localhost:8000` y expone `GET /health`, `GET /model-info` y `WS /ws/recognize`.
 
-Para permitir otro origen, configura `ALLOWED_ORIGINS` antes de iniciarlo. Ejemplo: `ALLOWED_ORIGINS=http://localhost:5173`.
+En desarrollo, `web/.env.example` deja `VITE_AI_WS_URL` vacio. El frontend usa el origen actual del navegador para conectar a `/ws/recognize`: `ws://localhost:5173/ws/recognize` por HTTP o `wss://localhost:5173/ws/recognize` por HTTPS. Vite reenvia esa ruta al servicio local `ws://127.0.0.1:8000`; por eso el navegador no necesita conectarse directamente al puerto 8000. El puerto de IA predeterminado es 8000.
 
-Para desarrollo en este equipo, abre el frontend en `http://localhost:5173`; los navegadores permiten usar la camara en `localhost`. Si se abre mediante una IP como `http://192.168.x.x:5173`, la camara sera bloqueada por el navegador porque esa direccion no usa HTTPS. Para pruebas desde otra maquina o un telefono, publica el frontend con HTTPS y agrega su origen `https://...` a `ALLOWED_ORIGINS` en un archivo `.env` basado en `.env.example`.
+El `.env.example` de este repositorio permite por defecto los origenes HTTP y HTTPS de `localhost:5173` y `127.0.0.1:5173`. Para el modo HTTPS, el frontend necesita los certificados locales indicados en `web/.env.example`; los archivos de certificado y clave se generan localmente y no se versionan. Para acceder desde otra maquina, publica el frontend con HTTPS y agrega su origen exacto a `ALLOWED_ORIGINS` en el `.env` de IA.
 
 Cuando se entrenen nuevas senas, publica juntos `lsc_sequence_model.keras`, `lsc_labels.json` y `lsc_config.json` dentro de `model/` y reinicia el servicio. El frontend recibe las etiquetas desde el servicio, por lo que no requiere una lista de senas quemada en codigo.
 
