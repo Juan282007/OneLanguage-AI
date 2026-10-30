@@ -13,7 +13,7 @@ services:
       AI_HOST: 0.0.0.0
       AI_PORT: 8000
       AI_RELOAD: "false"
-      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173,https://localhost:5173,https://127.0.0.1:5173}
     ports:
       - "${AI_HOST_PORT:-8000}:8000"
     volumes:
